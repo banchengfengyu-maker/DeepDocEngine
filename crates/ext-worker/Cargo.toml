@@ -1,0 +1,12 @@
+[package]
+name = "ext-worker"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+deepdoc-protocol = { path = "../protocol" }
+deepdoc-source-fs = { path = "../source-fs" }
+deepdoc-parsers = { path = "../parsers" }
+encoding_rs = "0.8"
+outlook-pst-ost = "1.3"

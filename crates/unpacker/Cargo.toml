@@ -1,0 +1,21 @@
+[package]
+name = "deepdoc-unpacker"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+deepdoc-protocol = { path = "../protocol" }
+zip = "~2.4.0"
+sevenz-rust2 = "0.25"
+tar = "0.4"
+flate2 = "1.1"
+bzip2 = "0.6"
+xz2 = "0.1"
+zstd = "0.14"
+cab = "0.6"
+unrar = "0.5"
+tempfile = "3"
+thiserror = "2"
+encoding_rs = "0.8"
+chardetng = "1.0"

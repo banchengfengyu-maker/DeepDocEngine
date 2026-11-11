@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/acadrust",
+    "crates/protocol",
+    "crates/rule-engine",
+    "crates/source-fs",
+    "crates/unpacker",
+    "crates/parsers",
+    "crates/indexer",
+    "crates/parser-worker",
+    "crates/ext-worker",
+    "crates/engine-daemon",
+]

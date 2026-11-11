@@ -1,0 +1,30 @@
+# Build artifacts & local staging
+/target/
+/dist/
+/dist_installer/
+/native_deps/
+*.pdb
+*.log
+
+# Visual Studio / .NET / WPF
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Local runtime / test databases & user settings
+deepdoc_data/
+ui_prefs.json
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Editor & OS files
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

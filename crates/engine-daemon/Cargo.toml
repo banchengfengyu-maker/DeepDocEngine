@@ -1,0 +1,24 @@
+[package]
+name = "engine-daemon"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+deepdoc-protocol = { path = "../protocol", features = ["async-io"] }
+deepdoc-rule-engine = { path = "../rule-engine" }
+deepdoc-source-fs = { path = "../source-fs" }
+deepdoc-indexer = { path = "../indexer" }
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+zip = "~2.4.0"
+encoding_rs = "0.8"

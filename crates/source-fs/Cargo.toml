@@ -1,0 +1,20 @@
+[package]
+name = "deepdoc-source-fs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+deepdoc-protocol = { path = "../protocol" }
+blake3 = "1"
+walkdir = "2.5"
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
