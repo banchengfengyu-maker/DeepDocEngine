@@ -168,18 +168,34 @@ struct ScannedAc18Page {
 pub struct DwgReadOptions {
     /// When `true`, recover as much data as possible from corrupt files.
     pub failsafe: bool,
+    /// When `true`, skip decoding and allocating non-text geometric entities (lines, arcs, hatches, etc.)
+    pub text_entities_only: bool,
 }
 
 impl Default for DwgReadOptions {
     fn default() -> Self {
-        Self { failsafe: false }
+        Self {
+            failsafe: false,
+            text_entities_only: false,
+        }
     }
 }
 
 impl DwgReadOptions {
     /// Create options with failsafe mode enabled.
     pub fn failsafe() -> Self {
-        Self { failsafe: true }
+        Self {
+            failsafe: true,
+            text_entities_only: false,
+        }
+    }
+
+    /// Create options with non-text geometric entities skipped for fast text/secret inspection.
+    pub fn text_only() -> Self {
+        Self {
+            failsafe: false,
+            text_entities_only: true,
+        }
     }
 }
 
@@ -349,6 +365,7 @@ impl<R: Read + Seek> DwgReader<R> {
                     Ok(obj_reader) => {
                         let mut builder = crate::io::dwg::dwg_document_builder::DwgDocumentBuilder::new(obj_reader);
                         builder.set_failsafe(failsafe);
+                        builder.set_text_entities_only(self.options.text_entities_only);
                         let build_notifications = builder.build(&mut document);
                         self.notifications.extend(build_notifications);
                     },

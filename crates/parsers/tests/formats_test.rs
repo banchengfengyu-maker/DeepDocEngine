@@ -809,3 +809,67 @@ fn verifies_deep_ocr_pdfium_x2t_and_rar5() {
 
     let _ = render_banner_png("OK");
 }
+
+#[test]
+fn metadata_fast_skip_and_oversized_file_and_image_guard_do_not_fail() {
+    use deepdoc_parsers::parse_file;
+
+    let ctx = ParserContext::new();
+    let dir = std::env::temp_dir().join(format!("deepdoc_fastskip_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 1. Metadata-only binary extensions (.dll / .rvt) skip disk content read cleanly
+    let fake_dll = dir.join("kernel_mod.dll");
+    std::fs::write(&fake_dll, b"MZ\x90\x00FAKE_DLL_BYTES").unwrap();
+    let (dll_doc, dll_children) = parse_file(
+        &ctx,
+        &fake_dll,
+        &fake_dll.to_string_lossy(),
+        &ParseOptions::default(),
+    )
+    .expect("dll metadata-only parse should succeed");
+    assert!(dll_children.is_empty());
+    assert!(dll_doc.metadata.iter().any(|(k, v)| k == "indexed_mode" && v == "metadata_only"));
+
+    // 2. Oversized regular file (> max_single_file_bytes) returns metadata-only Ok instead of ZipBombTripped
+    let big_bin = dir.join("large_model.rvt");
+    std::fs::write(&big_bin, vec![b'R'; 2048]).unwrap();
+    let mut small_cap = ParseOptions::default();
+    small_cap.max_single_file_bytes = 512;
+    let (big_doc, _) = parse_file(&ctx, &big_bin, &big_bin.to_string_lossy(), &small_cap)
+        .expect("oversized file should gracefully index metadata");
+    assert!(big_doc.metadata.iter().any(|(k, v)| k == "indexed_mode" && v == "metadata_only"));
+
+    // 3. Large CAD/map raster (6000x4000 = 24M <= 120M) is allowed for tiled OCR (not rejected),
+    //    while true pixel-bomb PNG (12500x10000 = 125M > 120M) is skipped before full RGB allocation
+    let make_white_gray_png = |w: u32, h: u32| -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut enc = png::Encoder::new(&mut buf, w, h);
+        enc.set_color(png::ColorType::Grayscale);
+        enc.set_depth(png::BitDepth::Eight);
+        if let Ok(mut writer) = enc.write_header() {
+            let full = vec![255u8; (w as usize) * (h as usize)];
+            let _ = writer.write_image_data(&full);
+        }
+        buf
+    };
+    let map_png = make_white_gray_png(4000, 3000);
+    let (map_doc, _) = parse_bytes(&ctx, &map_png, r"C:\cad\large_topo_map.png", &ParseOptions::default()).unwrap();
+    assert!(
+        !map_doc.warnings.iter().any(|w| w.contains("分辨率超过安全上限")),
+        "Large map sheet <= 120M pixels must be allowed for tiled OCR, got {:?}",
+        map_doc.warnings
+    );
+
+    let huge_png = make_white_gray_png(12500, 10000);
+    let (png_doc, _) = parse_bytes(&ctx, &huge_png, r"C:\cad\huge_sheet.png", &ParseOptions::default()).unwrap();
+    assert_eq!(png_doc.detected_format, "png");
+    assert!(
+        png_doc.warnings.iter().any(|w| w.contains("分辨率超过安全上限")),
+        "Expected oversized pixel guard warning (>120M pixels), got {:?}",
+        png_doc.warnings
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -30,9 +30,46 @@ pub fn parse_dwg_document(bytes: &[u8]) -> (OfficeParseResult, Vec<(String, Stri
     metadata.push(("dwg_version".into(), header_ver.clone()));
     metadata.push(("dwg_release".into(), release.into()));
 
-    let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        read_dwg_with_failsafe(bytes)
-    }));
+    const MAX_FULL_DWG_DOM_BYTES: usize = 48 * 1024 * 1024;
+    if bytes.len() > MAX_FULL_DWG_DOM_BYTES {
+        metadata.push(("dwg_engine".into(), "acadrust-carve-oversized".into()));
+        res.warnings.push(format!(
+            "DWG 体积 {:.1} MB 超过全树解析阈值（48 MB），已直接执行可见文本雕刻防内存溢出",
+            bytes.len() as f64 / (1024.0 * 1024.0)
+        ));
+        res.segments.push(TextSegment {
+            scope: SegmentScope::Metadata,
+            location_label: "DWG 文件头".into(),
+            text: format!("{release} ({header_ver})"),
+        });
+        let carved = carve_dwg_strings(bytes);
+        if !carved.is_empty() {
+            if let Some(ht) = build_head_tail_segment(&carved) {
+                res.segments.push(ht);
+            }
+            res.segments.push(TextSegment {
+                scope: SegmentScope::Body,
+                location_label: "DWG 可见文本雕刻".into(),
+                text: carved,
+            });
+        }
+        return (res, metadata);
+    }
+
+    // Run full acadrust DOM parse on an 8 MiB stack so deep nested blocks never overflow the 1 MiB default Windows stack.
+    let owned_bytes = bytes.to_vec();
+    let join_res = std::thread::Builder::new()
+        .name("dwg-parse".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || read_dwg_with_failsafe(&owned_bytes));
+
+    let read_result: std::thread::Result<Result<(CadDocument, Vec<String>), String>> = match join_res
+    {
+        Ok(handle) => handle.join(),
+        Err(_) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read_dwg_with_failsafe(bytes)
+        })),
+    };
 
     let (doc, dwg_warnings) = match read_result {
         Ok(Ok((doc, warnings))) => (doc, warnings),
@@ -316,14 +353,16 @@ pub fn parse_dwg_document(bytes: &[u8]) -> (OfficeParseResult, Vec<(String, Stri
 }
 
 fn read_dwg_with_failsafe(bytes: &[u8]) -> Result<(CadDocument, Vec<String>), String> {
-    let mut reader = DwgReader::from_stream(Cursor::new(bytes));
+    let mut reader = DwgReader::from_stream_with_options(Cursor::new(bytes), DwgReadOptions::text_only());
     match reader.read() {
         Ok(doc) => {
             let mut warnings: Vec<String> =
                 doc.notifications.iter().map(|n| n.message.clone()).collect();
             if doc.entity_count() == 0 && bytes.len() > 1_000_000 {
+                let mut fs_opts = DwgReadOptions::failsafe();
+                fs_opts.text_entities_only = true;
                 let mut fs_reader =
-                    DwgReader::from_stream_with_options(Cursor::new(bytes), DwgReadOptions::failsafe());
+                    DwgReader::from_stream_with_options(Cursor::new(bytes), fs_opts);
                 if let Ok(fs_doc) = fs_reader.read() {
                     if fs_doc.entity_count() > 0 {
                         warnings.extend(fs_doc.notifications.iter().map(|n| n.message.clone()));
@@ -334,8 +373,10 @@ fn read_dwg_with_failsafe(bytes: &[u8]) -> Result<(CadDocument, Vec<String>), St
             Ok((doc, warnings))
         }
         Err(first_err) => {
+            let mut fs_opts = DwgReadOptions::failsafe();
+            fs_opts.text_entities_only = true;
             let mut fs_reader =
-                DwgReader::from_stream_with_options(Cursor::new(bytes), DwgReadOptions::failsafe());
+                DwgReader::from_stream_with_options(Cursor::new(bytes), fs_opts);
             match fs_reader.read() {
                 Ok(fs_doc) => {
                     let mut warnings = vec![format!("DWG 标准读取回退 failsafe ({first_err})")];

@@ -76,6 +76,26 @@ fn main() {
                 options,
                 ..
             } => handle_ext_bytes(&tools, &parser_ctx, task_id, None, &data, &virtual_path, &options),
+            WorkerRequest::OcrImageBytes { task_id, label, .. } => WorkerResponse::Failed {
+                task_id,
+                virtual_path: label,
+                kind: FailureKind::Unsupported,
+                detail: "ext-worker does not run OCR tasks".into(),
+            },
+            WorkerRequest::OcrPdfPages {
+                task_id, disk_path, ..
+            } => WorkerResponse::Failed {
+                task_id,
+                virtual_path: disk_path,
+                kind: FailureKind::Unsupported,
+                detail: "ext-worker does not run PDF OCR tasks".into(),
+            },
+            WorkerRequest::ParseFilesBatch { task_id, .. } => WorkerResponse::Failed {
+                task_id,
+                virtual_path: String::new(),
+                kind: FailureKind::Unsupported,
+                detail: "ext-worker does not run ParseFilesBatch".into(),
+            },
         };
 
         if let Err(e) = write_frame_sync(&mut writer, &resp) {
@@ -175,6 +195,8 @@ fn make_parsed(
         doc,
         child_docs,
         new_ocr_entries: parser_ctx.ocr.take_new_cache_entries(),
+        deferred_images: Vec::new(),
+        deferred_pdf_pages: Vec::new(),
     }
 }
 
@@ -262,13 +284,21 @@ fn handle_ext_bytes(
     if bytes.starts_with(b"ITSF") || ext == "chm" {
         doc.detected_format = "chm".into();
         if let Some(ref sz) = tools.sevenz {
-            if let Ok(entries) = extract_with_7z(sz, bytes, "in.chm") {
+            if let Ok((entries, total_entries)) = extract_chm_text_with_7z(sz, bytes, "in.chm") {
+                let mut child_opts = options.clone();
+                child_opts.enable_ocr = false;
+                let extracted_count = entries.len();
                 for (name, data) in entries {
                     let child_vp = format!("{virtual_path}!/{name}");
-                    if let Ok((cd, gc)) = parse_bytes(parser_ctx, &data, &child_vp, options) {
+                    if let Ok((cd, gc)) = parse_bytes(parser_ctx, &data, &child_vp, &child_opts) {
                         children.push(cd);
                         children.extend(gc);
                     }
+                }
+                if total_entries > extracted_count {
+                    doc.warnings.push(format!(
+                        "CHM 包含较多条目（{total_entries} 个网页），已快速抽取前 {extracted_count} 篇文本（关闭内部图标 OCR）"
+                    ));
                 }
                 return make_parsed(parser_ctx, task_id, doc, children);
             }
@@ -796,6 +826,7 @@ fn run_readpst(tool: &Path, pst_path: &Path) -> Result<Vec<(String, Vec<u8>)>, s
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
+    let _guard = TempDirGuard(tmp.clone());
     std::fs::create_dir_all(&tmp)?;
     let out = Command::new(tool)
         .arg("-M")
@@ -812,7 +843,6 @@ fn run_readpst(tool: &Path, pst_path: &Path) -> Result<Vec<(String, Vec<u8>)>, s
     if out.status.success() {
         collect_dir(&tmp, &tmp, &mut entries)?;
     }
-    let _ = std::fs::remove_dir_all(&tmp);
     Ok(entries)
 }
 
@@ -825,6 +855,7 @@ fn run_dwg2dxf(tool: &Path, dwg_bytes: &[u8]) -> Result<Vec<u8>, std::io::Error>
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
+    let _guard = TempDirGuard(tmp.clone());
     std::fs::create_dir_all(&tmp)?;
     let in_p = tmp.join("in.dwg");
     let out_p = tmp.join("out.dxf");
@@ -839,17 +870,108 @@ fn run_dwg2dxf(tool: &Path, dwg_bytes: &[u8]) -> Result<Vec<u8>, std::io::Error>
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
-    let res = if out.status.success() && out_p.exists() {
+    if out.status.success() && out_p.exists() {
         std::fs::read(&out_p)
     } else {
         let stderr = String::from_utf8_lossy(&out.stderr);
         Err(std::io::Error::other(format!("dwg2dxf exited {}: {}", out.status, stderr.trim())))
-    };
-    let _ = std::fs::remove_dir_all(&tmp);
-    res
+    }
 }
 
-fn extract_with_7z(tool: &Path, bytes: &[u8], fname: &str) -> Result<Vec<(String, Vec<u8>)>, std::io::Error> {
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+const MAX_CHM_HTML_ENTRIES: usize = 250;
+const MAX_CHM_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+fn is_chm_text_entry(path: &str) -> bool {
+    let clean = path.trim();
+    if clean.is_empty() || clean.contains(['*', '?', '\r', '\n']) {
+        return false;
+    }
+    let lower = clean.to_ascii_lowercase();
+    [".htm", ".html", ".txt", ".hhc", ".hhk"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
+fn select_chm_paths_from_7z_list(
+    listing: &str,
+    max_entries: usize,
+    max_total_bytes: usize,
+) -> (Vec<String>, usize) {
+    let mut selected = Vec::new();
+    let mut total_text = 0usize;
+    let mut total_bytes = 0usize;
+    let mut cur_path: Option<String> = None;
+    let mut cur_is_folder = false;
+    let mut cur_size: usize = 0;
+
+    let flush_item = |path: &mut Option<String>,
+                      is_folder: &mut bool,
+                      size: &mut usize,
+                      selected: &mut Vec<String>,
+                      total_text: &mut usize,
+                      total_bytes: &mut usize| {
+        if let Some(p) = path.take() {
+            if !*is_folder && is_chm_text_entry(&p) {
+                *total_text += 1;
+                let entry_sz = (*size).max(1);
+                if selected.len() < max_entries
+                    && (*total_bytes).saturating_add(entry_sz) <= max_total_bytes
+                {
+                    *total_bytes = (*total_bytes).saturating_add(entry_sz);
+                    selected.push(p);
+                }
+            }
+        }
+        *is_folder = false;
+        *size = 0;
+    };
+
+    for raw_line in listing.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            flush_item(
+                &mut cur_path,
+                &mut cur_is_folder,
+                &mut cur_size,
+                &mut selected,
+                &mut total_text,
+                &mut total_bytes,
+            );
+            continue;
+        }
+        if let Some(p) = line.strip_prefix("Path = ") {
+            cur_path = Some(p.to_string());
+        } else if let Some(f) = line.strip_prefix("Folder = ") {
+            cur_is_folder = f.trim() == "+";
+        } else if let Some(sz) = line.strip_prefix("Size = ") {
+            cur_size = sz.trim().parse::<usize>().unwrap_or(0);
+        }
+    }
+    flush_item(
+        &mut cur_path,
+        &mut cur_is_folder,
+        &mut cur_size,
+        &mut selected,
+        &mut total_text,
+        &mut total_bytes,
+    );
+
+    (selected, total_text)
+}
+
+fn extract_chm_text_with_7z(
+    tool: &Path,
+    bytes: &[u8],
+    fname: &str,
+) -> Result<(Vec<(String, Vec<u8>)>, usize), std::io::Error> {
     let tmp = std::env::temp_dir().join(format!(
         "deepdoc_chm_{}_{}",
         std::process::id(),
@@ -858,27 +980,59 @@ fn extract_with_7z(tool: &Path, bytes: &[u8], fname: &str) -> Result<Vec<(String
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
+    let _guard = TempDirGuard(tmp.clone());
     std::fs::create_dir_all(&tmp)?;
     let in_p = tmp.join(fname);
     let out_dir = tmp.join("out");
     std::fs::create_dir_all(&out_dir)?;
     std::fs::write(&in_p, bytes)?;
-    let out = Command::new(tool)
-        .arg("x")
-        .arg("-y")
-        .arg(format!("-o{}", out_dir.display()))
+
+    let tool_dir = tool.parent().unwrap_or_else(|| Path::new("."));
+    // List archive entries first so multi-thousand-page SDK CHMs only extract <= 250 text files (< 8 MiB).
+    let list_out = Command::new(tool)
+        .arg("l")
+        .arg("-ba")
+        .arg("-slt")
+        .arg("-sccUTF-8")
         .arg(&in_p)
-        .current_dir(tool.parent().unwrap_or_else(|| Path::new(".")))
+        .current_dir(tool_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
+
     let mut entries = Vec::new();
+    if !list_out.status.success() {
+        return Ok((entries, 0));
+    }
+
+    let listing = String::from_utf8_lossy(&list_out.stdout);
+    let (selected_paths, total_text) =
+        select_chm_paths_from_7z_list(&listing, MAX_CHM_HTML_ENTRIES, MAX_CHM_TOTAL_BYTES);
+    if selected_paths.is_empty() {
+        return Ok((entries, total_text));
+    }
+
+    let list_file = tmp.join("extract_list.txt");
+    std::fs::write(&list_file, selected_paths.join("\n").as_bytes())?;
+    let list_arg = format!("@{}", list_file.display());
+
+    let out = Command::new(tool)
+        .arg("x")
+        .arg("-y")
+        .arg("-scsUTF-8")
+        .arg(format!("-o{}", out_dir.display()))
+        .arg(&in_p)
+        .arg(list_arg)
+        .current_dir(tool_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
     if out.status.success() {
         collect_dir(&out_dir, &out_dir, &mut entries)?;
     }
-    let _ = std::fs::remove_dir_all(&tmp);
-    Ok(entries)
+    Ok((entries, total_text))
 }
 
 fn collect_dir(base: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> std::io::Result<()> {
@@ -1046,5 +1200,41 @@ mod tests {
             }
             other => panic!("unexpected DWG fallback response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn chm_list_selection_caps_count_and_bytes_and_skips_assets() {
+        let listing = "\
+Path = #SYSTEM
+Folder = -
+Size = 4096
+
+Path = docs
+Folder = +
+Size = 0
+
+Path = docs\\a.htm
+Folder = -
+Size = 1000
+
+Path = docs\\logo.png
+Folder = -
+Size = 2000
+
+Path = docs\\b.html
+Folder = -
+Size = 3500
+
+Path = docs\\huge.html
+Folder = -
+Size = 5000
+
+Path = docs\\c.hhc
+Folder = -
+Size = 400
+";
+        let (sel, total) = select_chm_paths_from_7z_list(listing, 2, 5000);
+        assert_eq!(total, 4);
+        assert_eq!(sel, vec!["docs\\a.htm", "docs\\b.html"]);
     }
 }

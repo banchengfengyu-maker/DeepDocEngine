@@ -696,6 +696,10 @@ pub fn parse_sqlite_db(bytes: &[u8]) -> OfficeParseResult {
     }
 
     let _ = std::fs::remove_file(&tmp);
+    let wal_path = std::path::PathBuf::from(format!("{}-wal", tmp.display()));
+    let shm_path = std::path::PathBuf::from(format!("{}-shm", tmp.display()));
+    let _ = std::fs::remove_file(&wal_path);
+    let _ = std::fs::remove_file(&shm_path);
     res
 }
 

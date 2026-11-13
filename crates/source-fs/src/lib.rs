@@ -88,48 +88,121 @@ pub fn enumerate_roots(
 pub fn enumerate_roots_with_options(roots: &[String], opts: &ScanOptions) -> Vec<DiscoveredFile> {
     let mut out = Vec::new();
     for root_str in roots {
-        let root = PathBuf::from(root_str);
-        if !root.exists() {
-            continue;
-        }
-        if root.is_file() {
-            if let Ok(meta) = root.metadata() {
-                let entry = make_entry(root, &meta);
-                if matches_scan_filter(&entry, &meta, opts) {
-                    out.push(entry);
-                }
+        stream_root_with_options(root_str, opts, |entry| {
+            out.push(entry);
+            true
+        });
+    }
+    out
+}
+
+/// Stream discovered files under `root_str` immediately as they are found (pruned MFT first,
+/// falling back to multi-threaded `WalkDir` fan-out across top-level subdirectories).
+/// Returning `false` from `emit` cancels remaining traversal promptly.
+pub fn stream_root_with_options(
+    root_str: &str,
+    opts: &ScanOptions,
+    mut emit: impl FnMut(DiscoveredFile) -> bool,
+) {
+    let root = PathBuf::from(root_str);
+    if !root.exists() {
+        return;
+    }
+    if root.is_file() {
+        if let Ok(meta) = root.metadata() {
+            let entry = make_entry(root, &meta);
+            if matches_scan_filter(&entry, &meta, opts) {
+                let _ = emit(entry);
             }
-            continue;
         }
-        if opts.use_usn_if_available && is_drive_root(&root) {
-            if let Ok(usn_files) = try_enumerate_ntfs_usn(&root, opts.include_hidden) {
-                for entry in usn_files {
-                    if !is_excluded_path(&entry.disk_path, opts)
-                        && matches_name_ext_size(&entry, opts)
-                    {
-                        out.push(entry);
+        return;
+    }
+    if opts.use_usn_if_available && is_drive_root(&root) {
+        if try_enumerate_ntfs_usn_streaming(&root, opts, &mut emit).is_ok() {
+            return;
+        }
+    }
+
+    let Ok(rd) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let mut top_dirs = Vec::new();
+    for ent in rd.flatten() {
+        let p = ent.path();
+        if let Ok(ft) = ent.file_type() {
+            if ft.is_file() {
+                if let Ok(meta) = ent.metadata() {
+                    let disc = make_entry(p, &meta);
+                    if matches_scan_filter(&disc, &meta, opts) && !emit(disc) {
+                        return;
                     }
                 }
-                continue;
-            }
-        }
-        let walker = WalkDir::new(&root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| e.depth() == 0 || !is_dir_entry_excluded(e, opts));
-        for entry in walker.flatten() {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            if let Ok(meta) = entry.metadata() {
-                let disc = make_entry(entry.into_path(), &meta);
-                if matches_scan_filter(&disc, &meta, opts) {
-                    out.push(disc);
+            } else if ft.is_dir() {
+                let excluded = (!opts.include_hidden
+                    && ent.metadata().is_ok_and(|m| is_hidden_win(&m)))
+                    || is_excluded_path(&p, opts);
+                if !excluded {
+                    top_dirs.push(p);
                 }
             }
         }
     }
-    out
+    if top_dirs.is_empty() {
+        return;
+    }
+
+    let worker_threads = top_dirs.len().min(4);
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<DiscoveredFile>(1024);
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_threads {
+            let tx_w = tx.clone();
+            let dirs_ref = &top_dirs;
+            let idx_ref = &next_idx;
+            let cancel_ref = &cancelled;
+            scope.spawn(move || loop {
+                if cancel_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let idx = idx_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(dir) = dirs_ref.get(idx) else {
+                    break;
+                };
+                let walker = WalkDir::new(dir)
+                    .follow_links(false)
+                    .into_iter()
+                    .filter_entry(|e| {
+                        !cancel_ref.load(std::sync::atomic::Ordering::Relaxed)
+                            && (e.depth() == 0 || !is_dir_entry_excluded(e, opts))
+                    });
+                for entry in walker.flatten() {
+                    if cancel_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    if let Ok(meta) = entry.metadata() {
+                        let disc = make_entry(entry.into_path(), &meta);
+                        if matches_scan_filter(&disc, &meta, opts) && tx_w.send(disc).is_err() {
+                            cancel_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        for disc in rx {
+            if !emit(disc) {
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                break;
+            }
+        }
+    });
 }
 
 fn is_dir_entry_excluded(entry: &walkdir::DirEntry, opts: &ScanOptions) -> bool {
@@ -143,8 +216,7 @@ fn is_dir_entry_excluded(entry: &walkdir::DirEntry, opts: &ScanOptions) -> bool 
             }
         }
     }
-    let name = entry.file_name().to_string_lossy();
-    is_dir_name_excluded(&name, opts)
+    is_excluded_path(entry.path(), opts)
 }
 
 fn is_dir_name_excluded(dir_name: &str, opts: &ScanOptions) -> bool {
@@ -159,7 +231,10 @@ fn is_dir_name_excluded(dir_name: &str, opts: &ScanOptions) -> bool {
     }
     opts.excluded_dirs.iter().any(|ex| {
         let ex_l = ex.trim().to_ascii_lowercase();
-        !ex_l.is_empty() && (lower == ex_l || wildcard_match_ci(&ex_l, &lower))
+        !ex_l.is_empty()
+            && !ex_l.contains('\\')
+            && !ex_l.contains('/')
+            && (lower == ex_l || wildcard_match_ci(&ex_l, &lower))
     })
 }
 
@@ -167,6 +242,24 @@ pub fn is_excluded_path(path: &Path, opts: &ScanOptions) -> bool {
     for comp in path.components() {
         if let std::path::Component::Normal(seg) = comp {
             if is_dir_name_excluded(&seg.to_string_lossy(), opts) {
+                return true;
+            }
+        }
+    }
+    if opts
+        .excluded_dirs
+        .iter()
+        .any(|ex| ex.contains('\\') || ex.contains('/'))
+    {
+        let norm_path = path.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+        for ex in &opts.excluded_dirs {
+            let ex_norm = ex.trim().replace('/', "\\").trim_matches('\\').to_ascii_lowercase();
+            if ex_norm.is_empty() || !ex_norm.contains('\\') {
+                continue;
+            }
+            let mid = format!("\\{ex_norm}\\");
+            let end = format!("\\{ex_norm}");
+            if norm_path.contains(&mid) || norm_path.ends_with(&end) {
                 return true;
             }
         }
@@ -188,8 +281,8 @@ pub fn matches_scan_filter(
     matches_name_ext_size(entry, opts)
 }
 
-fn matches_name_ext_size(entry: &DiscoveredFile, opts: &ScanOptions) -> bool {
-    let fname_lower = entry.file_name.to_ascii_lowercase();
+fn matches_name_ext_only(file_name: &str, ext_lower: &str, opts: &ScanOptions) -> bool {
+    let fname_lower = file_name.to_ascii_lowercase();
     for pat in &opts.excluded_name_globs {
         let p = pat.trim().to_ascii_lowercase();
         if !p.is_empty() && wildcard_match_ci(&p, &fname_lower) {
@@ -199,11 +292,18 @@ fn matches_name_ext_size(entry: &DiscoveredFile, opts: &ScanOptions) -> bool {
     if !opts.include_extensions.is_empty() {
         let allowed = opts.include_extensions.iter().any(|e| {
             let clean = e.trim().trim_start_matches('.').to_ascii_lowercase();
-            !clean.is_empty() && clean == entry.ext_lower
+            !clean.is_empty() && clean == ext_lower
         });
         if !allowed {
             return false;
         }
+    }
+    true
+}
+
+fn matches_name_ext_size(entry: &DiscoveredFile, opts: &ScanOptions) -> bool {
+    if !matches_name_ext_only(&entry.file_name, &entry.ext_lower, opts) {
+        return false;
     }
     if let Some(min_sz) = opts.min_byte_size {
         if entry.byte_size < min_sz {
@@ -568,6 +668,65 @@ pub fn try_enumerate_ntfs_usn(
     drive_root: &Path,
     include_hidden: bool,
 ) -> Result<Vec<DiscoveredFile>, SourceError> {
+    let mut opts = ScanOptions::default();
+    opts.include_hidden = include_hidden;
+    let mut out = Vec::new();
+    try_enumerate_ntfs_usn_streaming(drive_root, &opts, &mut |f| {
+        out.push(f);
+        true
+    })?;
+    Ok(out)
+}
+
+#[cfg(windows)]
+fn resolve_mft_dir_cached(
+    dir_id: u64,
+    root_prefix: &Path,
+    dirs: &HashMap<u64, (u64, String)>,
+    opts: &ScanOptions,
+    cache: &mut HashMap<u64, Option<PathBuf>>,
+    depth: usize,
+) -> Option<PathBuf> {
+    if let Some(cached) = cache.get(&dir_id) {
+        return cached.clone();
+    }
+    if depth > 64 {
+        return None;
+    }
+    let resolved = match dirs.get(&dir_id) {
+        Some((parent_id, name)) => {
+            if is_dir_name_excluded(name, opts) {
+                None
+            } else {
+                let parent_path = if *parent_id == dir_id || !dirs.contains_key(parent_id) {
+                    Some(root_prefix.to_path_buf())
+                } else {
+                    resolve_mft_dir_cached(*parent_id, root_prefix, dirs, opts, cache, depth + 1)
+                };
+                parent_path.and_then(|mut p| {
+                    p.push(name);
+                    if is_excluded_path(&p, opts) {
+                        None
+                    } else {
+                        Some(p)
+                    }
+                })
+            }
+        }
+        None => Some(root_prefix.to_path_buf()),
+    };
+    cache.insert(dir_id, resolved.clone());
+    resolved
+}
+
+/// Fast Win32 NTFS USN/MFT streaming enumeration via `FSCTL_ENUM_USN_DATA` (read-only volume handle).
+/// Prunes excluded directories in memory using memoized directory paths BEFORE invoking any disk `metadata()`.
+#[cfg(windows)]
+fn try_enumerate_ntfs_usn_streaming(
+    drive_root: &Path,
+    opts: &ScanOptions,
+    emit: &mut dyn FnMut(DiscoveredFile) -> bool,
+) -> Result<(), SourceError> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -655,7 +814,7 @@ pub fn try_enumerate_ntfs_usn(
                 let name = String::from_utf16_lossy(name_slice);
                 let is_dir = (rec.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
                 let is_hidden = (rec.FileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) != 0;
-                if include_hidden || !is_hidden {
+                if opts.include_hidden || !is_hidden {
                     if is_dir {
                         dirs.insert(rec.FileReferenceNumber, (rec.ParentFileReferenceNumber, name));
                     } else {
@@ -668,32 +827,39 @@ pub fn try_enumerate_ntfs_usn(
         med.StartFileReferenceNumber = next_ref;
     }
 
-    let root_prefix = format!("{}:", drive_letter.to_ascii_uppercase());
-    let mut results = Vec::with_capacity(files.len());
+    let root_path = PathBuf::from(format!(r"{}:\", drive_letter.to_ascii_uppercase()));
+    let mut dir_cache: HashMap<u64, Option<PathBuf>> = HashMap::with_capacity(dirs.len().min(65536));
     for (parent_id, name) in files {
-        let mut parts = vec![name];
-        let mut cur = parent_id;
-        let mut hops = 0;
-        while let Some((pp, pname)) = dirs.get(&cur) {
-            if *pp == cur || hops > 64 {
-                break;
-            }
-            parts.push(pname.clone());
-            cur = *pp;
-            hops += 1;
+        let ext_lower = Path::new(&name)
+            .extension()
+            .map(|s| s.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches_name_ext_only(&name, &ext_lower, opts) {
+            continue;
         }
-        parts.reverse();
-        let mut full = PathBuf::from(format!(r"{root_prefix}\"));
-        for p in parts {
-            full.push(p);
-        }
+        let Some(mut full) = resolve_mft_dir_cached(parent_id, &root_path, &dirs, opts, &mut dir_cache, 0) else {
+            continue;
+        };
+        full.push(&name);
         if let Ok(meta) = full.metadata() {
             if meta.is_file() {
-                results.push(make_entry(full, &meta));
+                let disc = make_entry(full, &meta);
+                if matches_name_ext_size(&disc, opts) && !emit(disc) {
+                    break;
+                }
             }
         }
     }
-    Ok(results)
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn try_enumerate_ntfs_usn_streaming(
+    drive_root: &Path,
+    _opts: &ScanOptions,
+    _emit: &mut dyn FnMut(DiscoveredFile) -> bool,
+) -> Result<(), SourceError> {
+    Err(SourceError::UsnUnavailable(drive_root.display().to_string()))
 }
 
 #[cfg(not(windows))]
@@ -702,4 +868,43 @@ pub fn try_enumerate_ntfs_usn(
     _include_hidden: bool,
 ) -> Result<Vec<DiscoveredFile>, SourceError> {
     Err(SourceError::UsnUnavailable(drive_root.display().to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn excluded_dirs_matches_both_component_names_and_subpaths() {
+        let mut opts = ScanOptions::default();
+        opts.excluded_dirs = vec![
+            "node_modules".into(),
+            "Windows\\WinSxS".into(),
+            "AppData\\Local\\Temp".into(),
+            ".cargo\\registry".into(),
+        ];
+
+        assert!(is_excluded_path(Path::new(r"C:\Windows\WinSxS\amd64\foo.manifest"), &opts));
+        assert!(is_excluded_path(Path::new(r"C:\Users\YR\AppData\Local\Temp\abc.tmp"), &opts));
+        assert!(is_excluded_path(Path::new(r"C:\Users\YR\.cargo\registry\src\a.rs"), &opts));
+        assert!(is_excluded_path(Path::new(r"D:\repo\web\node_modules\pkg\index.js"), &opts));
+        assert!(!is_excluded_path(Path::new(r"D:\repo\src\main.rs"), &opts));
+        assert!(!is_excluded_path(Path::new(r"C:\Users\YR\Documents\contract.docx"), &opts));
+
+        let mut stream_opts = ScanOptions::default();
+        stream_opts.excluded_dirs = vec!["node_modules".into()];
+        let tmp = std::env::temp_dir().join(format!("deepdoc_stream_fs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("docs")).unwrap();
+        std::fs::create_dir_all(tmp.join("node_modules/pkg")).unwrap();
+        std::fs::write(tmp.join("docs/a.txt"), b"ok").unwrap();
+        std::fs::write(tmp.join("node_modules/pkg/skip.txt"), b"no").unwrap();
+        let mut streamed = Vec::new();
+        stream_root_with_options(&tmp.to_string_lossy(), &stream_opts, |f| {
+            streamed.push(f.file_name);
+            true
+        });
+        assert_eq!(streamed, vec!["a.txt"]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

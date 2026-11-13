@@ -1,266 +1,422 @@
 <Window x:Class="DocSentinel.UI.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="DeepDocEngine — 文档内容深度搜索工具 (全格式 / DWG / 图片与内嵌图OCR)"
-        Width="1360" Height="840" MinWidth="1040" MinHeight="640"
+        Title="DeepDocEngine — 文档内容深度搜索工具"
+        Icon="pack://application:,,,/Assets/app.ico"
+        Width="1020" Height="620" MinWidth="820" MinHeight="480"
         WindowStartupLocation="CenterScreen"
-        Background="#F1F5F9"
-        FontFamily="Microsoft YaHei UI, Segoe UI">
+        Background="#F8FAFC"
+        FontFamily="Microsoft YaHei UI, Segoe UI"
+        PreviewKeyDown="Window_PreviewKeyDown"
+        Closing="Window_Closing">
     <Grid>
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <!-- Top Daemon Status & Global Stats Bar -->
-        <Border Grid.Row="0" Background="#0F172A" Padding="14,10">
+        <!-- Row 0: Everything-style Grouped Top Menu Bar + Compact Engine Indicator -->
+        <Border Grid.Row="0" Background="#F1F5F9" BorderBrush="#CBD5E1" BorderThickness="0,0,0,1" Padding="4,2">
             <DockPanel LastChildFill="False">
-                <StackPanel Orientation="Horizontal" DockPanel.Dock="Left" VerticalAlignment="Center">
-                    <TextBlock Text="DeepDocEngine" Foreground="#F8FAFC" FontSize="17" FontWeight="Bold" VerticalAlignment="Center" />
-                    <Border x:Name="StatusBadge" Background="#DC2626" CornerRadius="10" Padding="8,2" Margin="12,0,0,0" VerticalAlignment="Center">
-                        <TextBlock x:Name="StatusBadgeText" Text="未连接" Foreground="#FFFFFF" FontSize="11" FontWeight="SemiBold" />
-                    </Border>
-                    <TextBlock x:Name="StatsText" Text="文档: 0 | 去重块: 0 | 加密: 0 | 失败: 0" Foreground="#94A3B8" FontSize="12" Margin="16,0,0,0" VerticalAlignment="Center" />
-                </StackPanel>
+                <Menu DockPanel.Dock="Left" Background="Transparent" VerticalAlignment="Center" FontSize="12.5">
+                    <MenuItem Header="文件(_F)">
+                        <MenuItem Header="添加索引文件夹..." InputGestureText="Ctrl+O" Click="MenuAddFolder_Click" />
+                        <MenuItem Header="添加索引文件..." Click="MenuAddFiles_Click" />
+                        <MenuItem Header="快速添加全部固定硬盘" Click="MenuAddFixedDrives_Click" />
+                        <MenuItem Header="快速添加可移动磁盘 (U盘)" Click="MenuAddUsbDrives_Click" />
+                        <Separator />
+                        <MenuItem Header="打开选中文件" InputGestureText="Enter" Click="MenuOpenFile_Click" FontWeight="SemiBold" />
+                        <MenuItem Header="打开文件所在目录" Click="MenuOpenFolder_Click" />
+                        <MenuItem Header="复制完整路径" InputGestureText="Ctrl+Shift+C" Click="MenuCopyPath_Click" />
+                        <MenuItem Header="文件属性..." InputGestureText="Alt+Enter" Click="MenuProperties_Click" />
+                        <Separator />
+                        <MenuItem Header="对文件夹执行深度查密..." Click="MenuDeepCheckFolder_Click" FontWeight="SemiBold" Foreground="#B45309" />
+                        <MenuItem Header="对文件执行深度查密..." Click="MenuDeepCheckFiles_Click" FontWeight="SemiBold" Foreground="#B45309" />
+                        <MenuItem Header="深度擦除选中文件（三遍防杀软覆写粉碎）" InputGestureText="Ctrl+Shift+Del"
+                                  Click="MenuDeepDeleteSelected_Click" Foreground="#DC2626" FontWeight="SemiBold" />
+                        <MenuItem Header="选择文件夹执行深度擦除..." Click="MenuDeepEraseFolder_Click" Foreground="#B91C1C" />
+                        <MenuItem Header="选择文件执行深度擦除..." Click="MenuDeepDeletePicker_Click" Foreground="#B91C1C" />
+                        <Separator />
+                        <MenuItem Header="退出(_X)" InputGestureText="Alt+F4" Click="MenuExit_Click" />
+                    </MenuItem>
 
-                <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" VerticalAlignment="Center">
-                    <Button x:Name="BtnDeepDeletePicker" Content="深度删除文件..." Click="BtnDeepDeletePicker_Click" Margin="0,0,8,0"
-                            Background="#991B1B" Foreground="#FEF2F2" BorderBrush="#B91C1C" ToolTip="安全慢速覆写并从硬盘与索引库彻底粉碎指定文件（不易触发杀软拦截）" />
-                    <Button x:Name="BtnConnect" Content="连接 / 启动引擎" Click="BtnConnect_Click" Margin="0,0,8,0" />
-                    <Button x:Name="BtnRefreshStats" Content="刷新统计" Click="BtnRefreshStats_Click" Margin="0,0,8,0" />
-                    <Button x:Name="BtnClearIndex" Content="清空索引" Click="BtnClearIndex_Click" Background="#7F1D1D" Foreground="#FEE2E2" BorderBrush="#991B1B" />
+                    <MenuItem Header="编辑(_E)">
+                        <MenuItem Header="复制完整路径" Click="MenuCopyPath_Click" />
+                        <MenuItem Header="复制文件名" Click="MenuCopyFileName_Click" />
+                        <MenuItem Header="复制所在目录" Click="MenuCopyDir_Click" />
+                        <Separator />
+                        <MenuItem Header="全选搜索结果" InputGestureText="Ctrl+A" Click="MenuSelectAll_Click" />
+                        <MenuItem Header="清空搜索框与筛选条件" InputGestureText="Ctrl+L" Click="MenuClearSearch_Click" />
+                    </MenuItem>
+
+                    <MenuItem Header="搜索(_S)">
+                        <MenuItem x:Name="MenuMatchAnd" Header="多词全部包含 (AND)" IsCheckable="True" IsChecked="True" Click="MenuMatchAnd_Click" />
+                        <MenuItem x:Name="MenuMatchOr" Header="任一词命中即可 (OR)" IsCheckable="True" Click="MenuMatchOr_Click" />
+                        <Separator />
+                        <MenuItem x:Name="MenuUseRegex" Header="启用正则表达式 (Regex)" IsCheckable="True" Click="MenuSearchFlag_Click" />
+                        <MenuItem x:Name="MenuUseExpr" Header="启用高级表达式 (NEAR / ONEAR / scope:)" IsCheckable="True" Click="MenuSearchFlag_Click" />
+                        <Separator />
+                        <MenuItem x:Name="MenuScopeParent" Header="限定检索字段">
+                            <MenuItem Header="全部字段" Tag="" IsCheckable="True" IsChecked="True" Click="MenuScopeItem_Click" />
+                            <MenuItem Header="仅文件名" Tag="FileName" IsCheckable="True" Click="MenuScopeItem_Click" />
+                            <MenuItem Header="首尾行" Tag="HeadTail" IsCheckable="True" Click="MenuScopeItem_Click" />
+                            <MenuItem Header="正文" Tag="Body" IsCheckable="True" Click="MenuScopeItem_Click" />
+                            <MenuItem Header="OCR / 图片与内嵌图" Tag="Ocr" IsCheckable="True" Click="MenuScopeItem_Click" />
+                            <MenuItem Header="表格内容" Tag="Table" IsCheckable="True" Click="MenuScopeItem_Click" />
+                            <MenuItem Header="文档元数据" Tag="Metadata" IsCheckable="True" Click="MenuScopeItem_Click" />
+                        </MenuItem>
+                        <Separator />
+                        <MenuItem Header="收藏当前检索表达式..." Click="MenuSaveCurrentQuery_Click" />
+                        <MenuItem Header="管理与批量运行收藏表达式..." InputGestureText="Ctrl+B" Click="MenuManageSavedQueries_Click" />
+                        <MenuItem x:Name="MenuQuickRules" Header="快捷运行收藏表达式" />
+                    </MenuItem>
+
+                    <MenuItem Header="索引(_I)">
+                        <MenuItem x:Name="MenuIncrementalScan" Header="立即增量索引 (USN / 跳过未变更)" InputGestureText="F5" Click="MenuIncrementalScan_Click" />
+                        <MenuItem x:Name="MenuRebuildScan" Header="手动重建索引 (保留图片 OCR 缓存)" Click="MenuRebuildScan_Click" />
+                        <MenuItem x:Name="MenuRebuildLowResourceScan" Header="手动重建索引 - 低占用模式 (单路省 CPU/内存)" Click="MenuRebuildLowResourceScan_Click" />
+                        <MenuItem x:Name="MenuDirectSearch" Header="临时直搜当前目录 (不写入索引库)" Click="MenuDirectSearch_Click" />
+                        <MenuItem x:Name="MenuCancelJob" Header="停止当前扫描 / 直搜任务" InputGestureText="Esc" IsEnabled="False" Click="MenuCancelJob_Click" />
+                        <Separator />
+                        <MenuItem Header="管理索引目录与扫描设置..." Click="MenuOpenIndexSettings_Click" />
+                        <MenuItem x:Name="MenuIdleIndex" Header="闲时自动增量索引 (连续3分钟无操作)" IsCheckable="True" Click="MenuOptionPref_Click" />
+                        <Separator />
+                        <MenuItem Header="连接 / 重启后台引擎" Click="MenuReconnect_Click" />
+                        <MenuItem Header="刷新索引统计" Click="MenuRefreshStats_Click" />
+                        <MenuItem Header="清空全部索引与原文缓存..." Click="MenuClearIndex_Click" Foreground="#B91C1C" />
+                    </MenuItem>
+
+                    <MenuItem Header="视图(_V)">
+                        <MenuItem x:Name="MenuTogglePreview" Header="显示右侧文件内容预览窗格" IsCheckable="True" IsChecked="True" InputGestureText="Alt+P" Click="MenuTogglePreview_Click" />
+                        <Separator />
+                        <MenuItem Header="选择显示列与顺序..." Click="MenuChooseColumns_Click" />
+                        <MenuItem x:Name="MenuColumnToggles" Header="显示列快速开关" />
+                        <MenuItem Header="恢复默认列布局" Click="MenuResetColumns_Click" />
+                        <Separator />
+                        <MenuItem Header="预览定位：上一处匹配" InputGestureText="Shift+F3" Click="BtnPrevHit_Click" />
+                        <MenuItem Header="预览定位：下一处匹配" InputGestureText="F3" Click="BtnNextHit_Click" />
+                    </MenuItem>
+
+                    <MenuItem Header="查密与擦除(_D)">
+                        <MenuItem x:Name="MenuDeepCheckFolder" Header="对文件夹执行深度查密..." Click="MenuDeepCheckFolder_Click" FontWeight="SemiBold" Foreground="#B45309" />
+                        <MenuItem x:Name="MenuDeepCheckFiles" Header="对文件执行深度查密..." Click="MenuDeepCheckFiles_Click" FontWeight="SemiBold" Foreground="#B45309" />
+                        <MenuItem x:Name="MenuDeepCheckRerunDefaults" Header="重查默认涉密词 (秘密/机密/绝密/内部文件/内部资料/不公开)" Click="MenuDeepCheckRerunDefaults_Click" />
+                        <MenuItem x:Name="MenuExitDeepCheck" Header="退出深度查密模式（恢复全库检索）" IsEnabled="False" Click="BtnExitDeepCheck_Click" />
+                        <Separator />
+                        <MenuItem x:Name="MenuDeepEraseFolder" Header="对文件夹执行深度擦除（三遍防杀软覆写）..." Click="MenuDeepEraseFolder_Click" Foreground="#DC2626" FontWeight="SemiBold" />
+                        <MenuItem x:Name="MenuDeepEraseFiles" Header="对文件执行深度擦除（三遍防杀软覆写）..." Click="MenuDeepDeletePicker_Click" Foreground="#B91C1C" />
+                    </MenuItem>
+
+                    <MenuItem Header="选项(_O)">
+                        <MenuItem x:Name="MenuEnableOcr" Header="启用图片与内嵌图 OCR 识别" IsCheckable="True" IsChecked="True" Click="MenuOptionPref_Click" />
+                        <MenuItem x:Name="MenuSkipTemp" Header="忽略系统目录、临时文件与开发依赖缓存" IsCheckable="True" IsChecked="True" Click="MenuOptionPref_Click" />
+                        <MenuItem x:Name="MenuLowResourceIndex" Header="默认启用低占用建库模式（单路空闲优先级，不卡顿前台）" IsCheckable="True" Click="MenuOptionPref_Click" />
+                        <MenuItem Header="自定义文件类型过滤后缀..." Click="MenuCustomExts_Click" />
+                        <Separator />
+                        <MenuItem x:Name="MenuConfirmClose" Header="关闭窗口前进行二次确认" IsCheckable="True" IsChecked="True" Click="MenuOptionPref_Click" />
+                        <MenuItem x:Name="MenuShellContextMenu" Header="在 Windows 右键菜单显示“深度查密 / 深度擦除”" IsCheckable="True" IsChecked="True" Click="MenuShellContextMenu_Click" />
+                        <MenuItem x:Name="MenuTopmost" Header="窗口总在最前 (Always on Top)" IsCheckable="True" Click="MenuTopmost_Click" />
+                    </MenuItem>
+
+                    <MenuItem Header="帮助(_H)">
+                        <MenuItem Header="检索语法与快捷键指南..." Click="MenuHelpSyntax_Click" />
+                        <MenuItem Header="关于 DeepDocEngine" Click="MenuAbout_Click" />
+                    </MenuItem>
+                </Menu>
+
+                <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="0,0,8,0">
+                    <TextBlock x:Name="StatsText" Text="已索引文档: 0" Foreground="#475569" FontSize="11.5" VerticalAlignment="Center" Margin="0,0,10,0" />
+                    <Border x:Name="StatusBadge" Background="#DC2626" CornerRadius="10" Padding="8,2" VerticalAlignment="Center"
+                            ToolTip="后台离线引擎运行状态指示（只读）">
+                        <TextBlock x:Name="StatusBadgeText" Text="● 未连接" Foreground="#FFFFFF" FontSize="11" FontWeight="SemiBold" />
+                    </Border>
                 </StackPanel>
             </DockPanel>
         </Border>
 
-        <!-- Main Workspace -->
-        <Grid Grid.Row="1" Margin="10">
+        <!-- Row 1: Search Box + Start Search Button + File Type Dropdown -->
+        <Grid Grid.Row="1" Margin="8,7,8,4">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="380" MinWidth="300" />
-                <ColumnDefinition Width="6" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="205" />
+            </Grid.ColumnDefinitions>
+
+            <Border Grid.Column="0" Background="#FFFFFF" BorderBrush="#94A3B8" BorderThickness="1" CornerRadius="4" Height="32">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="🔍" Foreground="#64748B" FontSize="13" VerticalAlignment="Center" Margin="9,0,4,0" />
+                    <Grid Grid.Column="1">
+                        <TextBox x:Name="TxtSearch" BorderThickness="0" Background="Transparent"
+                                 VerticalContentAlignment="Center" FontSize="13.5" Padding="2,0"
+                                 KeyDown="TxtSearch_KeyDown" TextChanged="TxtSearch_TextChanged" />
+                        <TextBlock x:Name="TxtSearchPlaceholder"
+                                   Text="输入关键词（空格分隔多词）、&quot;短语&quot; 搜索文件名/正文/OCR/DWG内容，按 Enter 或点击右侧【开始搜索】"
+                                   Foreground="#94A3B8" FontSize="12" VerticalAlignment="Center" Margin="4,0"
+                                   IsHitTestVisible="False" TextTrimming="CharacterEllipsis" />
+                    </Grid>
+                    <Button x:Name="BtnClearSearchText" Grid.Column="2" Content="✕" Visibility="Collapsed"
+                            Click="BtnClearSearchText_Click" Background="Transparent" BorderThickness="0"
+                            Foreground="#64748B" FontSize="11" Padding="8,0" Margin="0" ToolTip="清空关键词" />
+                </Grid>
+            </Border>
+
+            <Button x:Name="BtnSearch" Grid.Column="1" Style="{StaticResource PrimaryButton}"
+                    Content="开始搜索" Height="32" MinWidth="92" Margin="6,0,0,0" FontSize="13"
+                    Click="BtnSearch_Click" />
+
+            <ComboBox x:Name="CmbTypePreset" Grid.Column="2" Height="32" Margin="6,0,0,0"
+                      VerticalContentAlignment="Center" FontSize="12"
+                      SelectionChanged="CmbTypePreset_SelectionChanged"
+                      ToolTip="筛选指定文件类型（文档 / 表格 / CAD / 图片 / 压缩包 / 自定义后缀）">
+                <ComboBoxItem Content="全部文件类型" Tag="" IsSelected="True" />
+                <ComboBoxItem Content="文档 (Word / PDF / WPS / OFD)" Tag="docx,doc,wps,pdf,ofd,uof,txt,md,rtf" />
+                <ComboBoxItem Content="表格 (Excel / ET / CSV)" Tag="xlsx,xls,xlsm,et,ods,csv" />
+                <ComboBoxItem Content="演示 (PPT / WPS演示)" Tag="pptx,ppt,dps,odp" />
+                <ComboBoxItem Content="CAD 工程图纸 (DWG / DXF)" Tag="dwg,dxf" />
+                <ComboBoxItem Content="图片 (PNG / JPG / TIF 等)" Tag="png,jpg,jpeg,bmp,tif,tiff,gif,webp" />
+                <ComboBoxItem Content="压缩包与镜像 (ZIP / RAR / 7Z)" Tag="zip,rar,7z,tar,gz,iso,cab" />
+                <ComboBoxItem Content="邮件 (EML / MSG / PST)" Tag="eml,mbox,msg,pst,ost" />
+                <ComboBoxItem x:Name="CmbTypeCustomItem" Content="自定义后缀..." Tag="__CUSTOM__" />
+            </ComboBox>
+        </Grid>
+
+        <!-- Row 2: Directory Selector Dropdown + Manual Directory Input Box -->
+        <Grid Grid.Row="2" Margin="8,0,8,7">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="260" />
                 <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>
 
-            <!-- Left Column: Sources + Saved Deep Queries -->
-            <Grid Grid.Column="0">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="335" MinHeight="260" />
-                    <RowDefinition Height="8" />
-                    <RowDefinition Height="*" MinHeight="180" />
-                </Grid.RowDefinitions>
+            <ComboBox x:Name="CmbDirSelect" Grid.Column="0" Height="29"
+                      VerticalContentAlignment="Center" FontSize="12"
+                      SelectionChanged="CmbDirSelect_SelectionChanged"
+                      ToolTip="从已索引目录或常用目录中选择，选【浏览选择目录...】可手动挑选任意文件夹" />
 
-                <!-- Data Sources & Fast Filter Panel -->
-                <Border Grid.Row="0" Background="#FFFFFF" CornerRadius="6" BorderBrush="#CBD5E1" BorderThickness="1" Padding="10">
-                    <DockPanel>
-                        <TextBlock DockPanel.Dock="Top" Text="1. 搜索范围与解析选项（支持直接拖入文件夹/文件）" FontWeight="SemiBold" FontSize="13" Foreground="#0F172A" Margin="0,0,0,6" />
-                        <StackPanel DockPanel.Dock="Bottom" Margin="0,6,0,0">
-                            <WrapPanel Margin="0,0,0,6">
-                                <Button Content="添加文件夹" Click="BtnAddFolder_Click" Margin="0,0,4,4" />
-                                <Button Content="添加文件" Click="BtnAddFiles_Click" Margin="0,0,4,4" />
-                                <Button Content="固定硬盘" Click="BtnAddFixedDrives_Click" Margin="0,0,4,4" ToolTip="添加本机全部固定盘根目录（优先启用 NTFS USN 秒级扫描）" />
-                                <Button Content="U盘" Click="BtnAddUsbDrives_Click" Margin="0,0,4,4" ToolTip="添加当前插入的可移动磁盘" />
-                                <Button Content="移除" Click="BtnRemoveRoot_Click" Margin="0,0,0,4" />
-                            </WrapPanel>
-                            <Grid Margin="0,0,0,6">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="100" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Grid.Column="0" Text="仅扫后缀:" VerticalAlignment="Center" FontSize="11" Foreground="#475569" Margin="0,0,4,0" />
-                                <TextBox x:Name="TxtIncludeExts" Grid.Column="1" FontSize="11" Padding="4,2" ToolTip="留空扫全部支持文档（Office/PDF/WPS/DWG/图片/邮件/压缩包等），可填 pdf,docx,dwg,png" />
-                                <TextBlock Grid.Column="2" Text="密码:" VerticalAlignment="Center" FontSize="11" Foreground="#475569" Margin="6,0,4,0" />
-                                <TextBox x:Name="TxtPassword" Grid.Column="3" FontSize="11" Padding="4,2" ToolTip="可选解压/PDF/Access通用密码" />
-                            </Grid>
-                            <WrapPanel Margin="0,0,0,6">
-                                <CheckBox x:Name="ChkEnableOcr" Content="图片与内嵌图OCR" IsChecked="True" VerticalAlignment="Center" FontSize="11" Margin="0,0,10,2" />
-                                <CheckBox x:Name="ChkSkipTemp" Content="忽略~$临时/系统目录" IsChecked="True" VerticalAlignment="Center" Margin="0,0,10,2" FontSize="11" />
-                                <CheckBox x:Name="ChkIdleIndex" Content="闲时自动增量(3分)" IsChecked="False" VerticalAlignment="Center" Margin="0,0,0,2" FontSize="11"
-                                          ToolTip="连续 3 分钟无键鼠操作且存在目录时，自动低优先级增量更新索引（无后台实时文件监控驻留）" />
-                            </WrapPanel>
-                            <WrapPanel>
-                                <Button x:Name="BtnStartScan" Style="{StaticResource PrimaryButton}" Content="增量索引" Click="BtnStartScan_Click" Margin="0,0,6,4"
-                                        ToolTip="跳过未变更文件并利用 NTFS USN 日志快速增量更新索引" />
-                                <Button x:Name="BtnRebuildScan" Content="重建索引" Click="BtnRebuildScan_Click" Margin="0,0,6,4"
-                                        ToolTip="清空当前文档库后全量重建索引（自动保留图片 OCR 缓存）" />
-                                <Button x:Name="BtnDirectSearch" Content="临时直搜(不落库)" Click="BtnDirectSearch_Click" Margin="0,0,6,4"
-                                        ToolTip="不写入本地索引库，直接按右侧搜索框关键词并发直搜所选目录" />
-                                <Button x:Name="BtnCancelScan" Content="停止" Click="BtnCancelScan_Click" IsEnabled="False" Margin="0,0,0,4" />
-                            </WrapPanel>
-                        </StackPanel>
-                        <ListBox x:Name="RootsList" AllowDrop="True" DragOver="RootsList_DragOver" Drop="RootsList_Drop"
-                                 BorderBrush="#E2E8F0" Background="#F8FAFC" FontSize="12" />
-                    </DockPanel>
-                </Border>
+            <Border Grid.Column="1" Margin="6,0,0,0" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="1" CornerRadius="4" Height="29">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="目录:" Foreground="#64748B" FontSize="11.5" VerticalAlignment="Center" Margin="8,0,4,0" />
+                    <Grid Grid.Column="1">
+                        <TextBox x:Name="TxtDirFilter" BorderThickness="0" Background="Transparent"
+                                 VerticalContentAlignment="Center" FontSize="12" Padding="2,0"
+                                 AllowDrop="True" PreviewDragOver="TxtDirFilter_DragOver" Drop="TxtDirFilter_Drop"
+                                 KeyDown="TxtDirFilter_KeyDown" TextChanged="TxtDirFilter_TextChanged" />
+                        <TextBlock x:Name="TxtDirFilterPlaceholder"
+                                   Text="手动输入指定文件目录路径，或左侧下拉选择 / 直接拖入文件夹（留空搜全部目录）"
+                                   Foreground="#94A3B8" FontSize="11.5" VerticalAlignment="Center" Margin="4,0"
+                                   IsHitTestVisible="False" TextTrimming="CharacterEllipsis" />
+                    </Grid>
+                    <Button x:Name="BtnClearDirFilter" Grid.Column="2" Content="✕" Visibility="Collapsed"
+                            Click="BtnClearDirFilter_Click" Background="Transparent" BorderThickness="0"
+                            Foreground="#64748B" FontSize="11" Padding="8,0" Margin="0" ToolTip="清空指定目录" />
+                </Grid>
+            </Border>
+        </Grid>
 
-                <!-- Saved Deep Search Expressions Panel -->
-                <Border Grid.Row="2" Background="#FFFFFF" CornerRadius="6" BorderBrush="#CBD5E1" BorderThickness="1" Padding="10">
-                    <DockPanel>
-                        <StackPanel DockPanel.Dock="Top" Margin="0,0,0,6">
-                            <TextBlock Text="2. 常用高级检索式收藏（双击立即检索）" FontWeight="SemiBold" FontSize="13" Foreground="#0F172A" />
-                            <TextBlock Text="支持: NEAR(词1,词2,15) ONEAR SAMELINE &amp; | ! &quot;短语&quot; re:/正则/ scope:ocr(...)" FontSize="11" Foreground="#64748B" TextWrapping="Wrap" Margin="0,2,0,0" />
-                        </StackPanel>
-                        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,6,0,0">
-                            <Button Content="+ 收藏检索式" Click="BtnAddRule_Click" />
-                            <Button Content="- 删除" Click="BtnDeleteRule_Click" Margin="4,0,0,0" />
-                            <Button x:Name="BtnEvalRules" Style="{StaticResource PrimaryButton}" Content="批量运行所选" Click="BtnEvalRules_Click" Margin="6,0,0,0" />
-                        </StackPanel>
-                        <DataGrid x:Name="RulesGrid" AutoGenerateColumns="False" CanUserAddRows="False"
-                                  HeadersVisibility="Column" GridLinesVisibility="Horizontal"
-                                  MouseDoubleClick="RulesGrid_MouseDoubleClick"
-                                  BorderBrush="#E2E8F0" Background="#FFFFFF" RowHeight="26" FontSize="12">
-                            <DataGrid.Columns>
-                                <DataGridTextColumn Header="名称" Binding="{Binding Name}" Width="105" />
-                                <DataGridTextColumn Header="高级搜索表达式" Binding="{Binding Expression}" Width="*" />
-                            </DataGrid.Columns>
-                        </DataGrid>
-                    </DockPanel>
-                </Border>
-            </Grid>
+        <!-- Row 3: Left Result Table View | Right Keyword-Focused Content Preview -->
+        <Grid Grid.Row="3" Margin="8,0,8,4">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition x:Name="ResultsColumn" Width="1.12*" MinWidth="320" />
+                <ColumnDefinition x:Name="SplitterColumn" Width="5" />
+                <ColumnDefinition x:Name="PreviewColumn" Width="0.98*" MinWidth="310" />
+            </Grid.ColumnDefinitions>
 
-            <GridSplitter Grid.Column="1" HorizontalAlignment="Stretch" Background="Transparent" />
-
-            <!-- Right Column: Search + Virtualized Results + Provenance Preview -->
-            <Grid Grid.Column="2">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="8" />
-                    <RowDefinition Height="*" MinHeight="180" />
-                    <RowDefinition Height="6" />
-                    <RowDefinition Height="280" MinHeight="160" />
-                </Grid.RowDefinitions>
-
-                <!-- Search Bar -->
-                <Border Grid.Row="0" Background="#FFFFFF" CornerRadius="6" BorderBrush="#CBD5E1" BorderThickness="1" Padding="10">
-                    <StackPanel>
+            <!-- Left Pane: Everything-style Virtualized Table View -->
+            <Border Grid.Column="0" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="1" CornerRadius="4">
+                <DockPanel>
+                    <Border DockPanel.Dock="Top" Background="#F8FAFC" BorderBrush="#E2E8F0" BorderThickness="0,0,0,1" Padding="8,5">
+                        <TextBlock x:Name="ResultsHeader"
+                                   Text="就绪 — 右键表头可增删/排序列，单击行在右侧预览并定位关键词，右键行可执行打开/定位/深度删除"
+                                   FontSize="11.5" Foreground="#475569" TextTrimming="CharacterEllipsis" />
+                    </Border>
+                    <Border x:Name="DeepCheckBanner" DockPanel.Dock="Top" Visibility="Collapsed"
+                            Background="#FEF3C7" BorderBrush="#F59E0B" BorderThickness="0,0,0,1" Padding="8,5">
                         <Grid>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="125" />
-                                <ColumnDefinition Width="110" />
-                                <ColumnDefinition Width="Auto" />
                                 <ColumnDefinition Width="Auto" />
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
-                            <TextBox x:Name="TxtSearch" Grid.Column="0" Padding="8,6" FontSize="13" VerticalContentAlignment="Center"
-                                     KeyDown="TxtSearch_KeyDown" ToolTip="支持空格分隔多个关键词（可在右侧切换全部命中/任一命中）；勾选[表达式]可用 NEAR(A,B,20) / &amp; / | / scope:ocr(...)" />
-                            <ComboBox x:Name="CmbMultiKeyword" Grid.Column="1" Margin="6,0,0,0" SelectedIndex="0" VerticalContentAlignment="Center" FontSize="11"
-                                      ToolTip="空格分隔多个关键词时的匹配逻辑">
-                                <ComboBoxItem Content="多词: 全部包含(AND)" Tag="all" />
-                                <ComboBoxItem Content="多词: 任一命中(OR)" Tag="any" />
-                            </ComboBox>
-                            <ComboBox x:Name="CmbScopeFilter" Grid.Column="2" Margin="6,0,0,0" SelectedIndex="0" VerticalContentAlignment="Center">
-                                <ComboBoxItem Content="全部字段" Tag="" />
-                                <ComboBoxItem Content="文件名" Tag="FileName" />
-                                <ComboBoxItem Content="首尾行" Tag="HeadTail" />
-                                <ComboBoxItem Content="正文" Tag="Body" />
-                                <ComboBoxItem Content="OCR/内嵌图" Tag="Ocr" />
-                                <ComboBoxItem Content="表格" Tag="Table" />
-                                <ComboBoxItem Content="元数据" Tag="Metadata" />
-                            </ComboBox>
-                            <CheckBox x:Name="ChkRegexSearch" Grid.Column="3" Content="正则" VerticalAlignment="Center" Margin="8,0,0,0" />
-                            <CheckBox x:Name="ChkExprMode" Grid.Column="4" Content="表达式(NEAR)" VerticalAlignment="Center" Margin="8,0,8,0" ToolTip="勾选后使用高精度布尔与邻近检索引擎: NEAR(A,B,20) / ONEAR / SAMELINE / scope:ocr(...)" />
-                            <Button x:Name="BtnSearch" Grid.Column="5" Style="{StaticResource PrimaryButton}" Content="立即搜索" Click="BtnSearch_Click" />
+                            <TextBlock x:Name="DeepCheckBannerText" Grid.Column="0"
+                                       Text="🔒 深度查密模式：已停止其他任务，可继续在上方搜索框输入更多关键词深查本目标"
+                                       Foreground="#92400E" FontSize="11.5" FontWeight="SemiBold"
+                                       VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                            <Button Grid.Column="1" Content="重查默认词" Click="MenuDeepCheckRerunDefaults_Click"
+                                    Background="#FFFFFF" BorderBrush="#D97706" Foreground="#92400E"
+                                    FontSize="11" Padding="8,2" Margin="6,0,0,0" ToolTip="重新查密默认关键词（秘密 机密 绝密 内部文件 内部资料 不公开）" />
+                            <Button Grid.Column="2" Content="退出查密" Click="BtnExitDeepCheck_Click"
+                                    Background="#FFFFFF" BorderBrush="#B45309" Foreground="#78350F"
+                                    FontSize="11" Padding="8,2" Margin="4,0,0,0" ToolTip="退出深度查密模式并恢复常规全局检索" />
                         </Grid>
-                        <Grid Margin="0,6,0,0">
+                    </Border>
+                    <Border x:Name="FastPassBanner" DockPanel.Dock="Top" Visibility="Collapsed"
+                            Background="#ECFDF5" BorderBrush="#6EE7B7" BorderThickness="0,0,0,1" Padding="8,5">
+                        <Grid>
                             <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="150" />
-                                <ColumnDefinition Width="125" />
-                                <ColumnDefinition Width="Auto" />
                                 <ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
-                            <TextBlock Grid.Column="0" Text="文件类型:" VerticalAlignment="Center" FontSize="11" Foreground="#475569" Margin="0,0,4,0" />
-                            <ComboBox x:Name="CmbTypePreset" Grid.Column="1" SelectedIndex="0" SelectionChanged="CmbTypePreset_SelectionChanged" FontSize="11" VerticalContentAlignment="Center">
-                                <ComboBoxItem Content="全部格式" Tag="" />
-                                <ComboBoxItem Content="文档 (Word/PDF/WPS/OFD)" Tag="docx,doc,wps,pdf,ofd,uof,txt,md,rtf" />
-                                <ComboBoxItem Content="表格 (Excel/ET/CSV)" Tag="xlsx,xls,xlsm,et,ods,csv" />
-                                <ComboBoxItem Content="演示 (PPT/WPS演示)" Tag="pptx,ppt,dps,odp" />
-                                <ComboBoxItem Content="CAD工程图纸 (DWG/DXF)" Tag="dwg,dxf" />
-                                <ComboBoxItem Content="图片 (PNG/JPG/TIF等)" Tag="png,jpg,jpeg,bmp,tif,tiff,gif,webp" />
-                                <ComboBoxItem Content="压缩包 (ZIP/RAR/7Z等)" Tag="zip,rar,7z,tar,gz,iso,cab" />
-                                <ComboBoxItem Content="邮件 (EML/MSG/PST)" Tag="eml,mbox,msg,pst,ost" />
-                            </ComboBox>
-                            <TextBox x:Name="TxtExtFilter" Grid.Column="2" Margin="6,0,0,0" Padding="6,4" FontSize="11"
-                                     VerticalContentAlignment="Center" ToolTip="支持逗号分隔多后缀过滤，如 pdf,docx,dwg" />
-                            <TextBlock Grid.Column="3" Text="指定目录:" VerticalAlignment="Center" FontSize="11" Foreground="#475569" Margin="10,0,4,0" />
-                            <TextBox x:Name="TxtDirFilter" Grid.Column="4" Padding="6,4" FontSize="11" VerticalContentAlignment="Center"
-                                     ToolTip="留空表示全局搜索；填写或选择目录后仅在该目录及子目录下检索（同样支持表达式模式）" />
-                            <Button Grid.Column="5" Content="选目录..." Click="BtnPickDirFilter_Click" Margin="4,0,0,0" Padding="8,3" FontSize="11" />
-                            <Button Grid.Column="6" Content="清空" Click="BtnClearDirFilter_Click" Margin="4,0,0,0" Padding="8,3" FontSize="11" />
+                            <TextBlock x:Name="FastPassBannerText" Grid.Column="0"
+                                       Text="基础索引已完成，您可以先开始搜索；后台正在低负载慢慢进行 OCR 识图..."
+                                       Foreground="#065F46" FontSize="11.5" FontWeight="SemiBold"
+                                       VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                            <Button Grid.Column="1" Content="✕" Click="BtnCloseFastPassBanner_Click"
+                                    Background="Transparent" BorderThickness="0" Foreground="#047857"
+                                    FontSize="11" Padding="6,0" Margin="6,0,0,0" ToolTip="收起提示" />
                         </Grid>
-                    </StackPanel>
-                </Border>
+                    </Border>
+                    <DataGrid x:Name="ResultsGrid"
+                              AutoGenerateColumns="False"
+                              IsReadOnly="True"
+                              CanUserReorderColumns="True"
+                              CanUserResizeColumns="True"
+                              CanUserSortColumns="True"
+                              EnableRowVirtualization="True"
+                              EnableColumnVirtualization="True"
+                              VirtualizingPanel.IsVirtualizing="True"
+                              VirtualizingPanel.VirtualizationMode="Recycling"
+                              SelectionMode="Extended"
+                              HeadersVisibility="Column"
+                              GridLinesVisibility="Horizontal"
+                              HorizontalGridLinesBrush="#F1F5F9"
+                              AlternatingRowBackground="#FAFBFD"
+                              BorderThickness="0"
+                              Background="#FFFFFF"
+                              RowHeight="25"
+                              FontSize="12"
+                              SelectionChanged="ResultsGrid_SelectionChanged"
+                              MouseDoubleClick="ResultsGrid_MouseDoubleClick"
+                              PreviewKeyDown="ResultsGrid_PreviewKeyDown"
+                              ColumnReordered="ResultsGrid_ColumnReordered"
+                              ContextMenuOpening="ResultsGrid_ContextMenuOpening">
+                        <DataGrid.Resources>
+                            <Style TargetType="DataGridRow">
+                                <Setter Property="SnapsToDevicePixels" Value="True" />
+                                <Style.Triggers>
+                                    <Trigger Property="IsSelected" Value="True">
+                                        <Setter Property="Background" Value="#DBEAFE" />
+                                        <Setter Property="Foreground" Value="#0F172A" />
+                                    </Trigger>
+                                </Style.Triggers>
+                            </Style>
+                            <Style TargetType="DataGridCell">
+                                <Setter Property="BorderThickness" Value="0" />
+                                <Setter Property="Padding" Value="6,0" />
+                                <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+                                <Style.Triggers>
+                                    <Trigger Property="IsSelected" Value="True">
+                                        <Setter Property="Background" Value="#DBEAFE" />
+                                        <Setter Property="Foreground" Value="#0F172A" />
+                                    </Trigger>
+                                </Style.Triggers>
+                            </Style>
+                        </DataGrid.Resources>
+                        <DataGrid.ContextMenu>
+                            <ContextMenu />
+                        </DataGrid.ContextMenu>
+                        <DataGrid.Columns>
+                            <DataGridTextColumn x:Name="ColFileName" Header="名称" Binding="{Binding FileName}" SortMemberPath="FileName" Width="190" />
+                            <DataGridTextColumn x:Name="ColModified" Header="修改日期" Binding="{Binding ModifiedDisplay}" SortMemberPath="ModifiedUnixMs" Width="125" />
+                            <DataGridTextColumn x:Name="ColFileType" Header="类型" Binding="{Binding FileTypeDisplay}" SortMemberPath="Format" Width="68" />
+                            <DataGridTextColumn x:Name="ColDirectory" Header="所在目录" Binding="{Binding Directory}" SortMemberPath="Directory" Width="210" />
+                            <DataGridTextColumn x:Name="ColFileSize" Header="大小" Binding="{Binding SizeDisplay}" SortMemberPath="ByteSize" Width="82">
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="HorizontalAlignment" Value="Right" />
+                                        <Setter Property="VerticalAlignment" Value="Center" />
+                                        <Setter Property="Padding" Value="0,0,6,0" />
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
+                            <DataGridTextColumn x:Name="ColLocation" Header="命中来源" Binding="{Binding LocationLabel}" SortMemberPath="LocationLabel" Width="125" />
+                            <DataGridTextColumn x:Name="ColSnippet" Header="命中摘要" Binding="{Binding Snippet}" SortMemberPath="Snippet" Width="220" Visibility="Collapsed" />
+                            <DataGridTextColumn x:Name="ColRuleOrScore" Header="匹配度/规则" Binding="{Binding RuleOrScore}" SortMemberPath="RuleOrScore" Width="110" Visibility="Collapsed" />
+                            <DataGridTextColumn x:Name="ColVirtualPath" Header="完整路径" Binding="{Binding VirtualPath}" SortMemberPath="VirtualPath" Width="260" Visibility="Collapsed" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </DockPanel>
+            </Border>
 
-                <!-- Results Virtualized DataGrid -->
-                <Border Grid.Row="2" Background="#FFFFFF" CornerRadius="6" BorderBrush="#CBD5E1" BorderThickness="1" Padding="6">
-                    <DockPanel>
-                        <TextBlock x:Name="ResultsHeader" DockPanel.Dock="Top" Text="搜索命中文档列表（单击预览定位，双击直接打开原文件）"
-                                   FontWeight="SemiBold" FontSize="12" Foreground="#334155" Margin="4,2,0,6" />
-                        <DataGrid x:Name="ResultsGrid" AutoGenerateColumns="False" IsReadOnly="True"
-                                  EnableRowVirtualization="True" EnableColumnVirtualization="True"
-                                  VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
-                                  SelectionMode="Extended" SelectionChanged="ResultsGrid_SelectionChanged"
-                                  MouseDoubleClick="ResultsGrid_MouseDoubleClick"
-                                  GridLinesVisibility="Horizontal" BorderThickness="0" RowHeight="26" FontSize="12">
-                            <DataGrid.ContextMenu>
-                                <ContextMenu>
-                                    <MenuItem Header="打开文件" Click="MenuOpenFile_Click" />
-                                    <MenuItem Header="打开文件所在目录" Click="MenuOpenFolder_Click" />
-                                    <MenuItem Header="复制完整路径" Click="MenuCopyPath_Click" />
-                                    <Separator />
-                                    <MenuItem Header="限定搜索到该文件所在目录" Click="MenuFilterByRowFolder_Click" />
-                                    <Separator />
-                                    <MenuItem Header="深度删除选中文件（防杀软慢速擦除）" Click="MenuDeepDeleteSelected_Click" Foreground="#DC2626" />
-                                </ContextMenu>
-                            </DataGrid.ContextMenu>
-                            <DataGrid.Columns>
-                                <DataGridTextColumn Header="方式" Binding="{Binding KindBadge}" Width="55" />
-                                <DataGridTextColumn Header="文件名" Binding="{Binding FileName}" Width="165" />
-                                <DataGridTextColumn Header="格式" Binding="{Binding Format}" Width="55" />
-                                <DataGridTextColumn Header="相关度 / 命中" Binding="{Binding RuleOrScore}" Width="125" />
-                                <DataGridTextColumn Header="命中来源（正文/OCR/DWG等）" Binding="{Binding LocationLabel}" Width="165" />
-                                <DataGridTextColumn Header="命中上下文片段" Binding="{Binding Snippet}" Width="*" />
-                                <DataGridTextColumn Header="文档路径" Binding="{Binding VirtualPath}" Width="210" />
-                            </DataGrid.Columns>
-                        </DataGrid>
-                    </DockPanel>
-                </Border>
+            <GridSplitter x:Name="MainSplitter" Grid.Column="1" HorizontalAlignment="Stretch"
+                          Background="Transparent" ResizeBehavior="PreviousAndNext" Cursor="SizeWE" />
 
-                <GridSplitter Grid.Row="3" HorizontalAlignment="Stretch" Background="Transparent" />
+            <!-- Right Pane: Keyword-Focused Document Content Preview -->
+            <Border x:Name="PreviewContainer" Grid.Column="2" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="1" CornerRadius="4">
+                <DockPanel>
+                    <Border DockPanel.Dock="Top" Background="#F8FAFC" BorderBrush="#E2E8F0" BorderThickness="0,0,0,1" Padding="10,6">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
 
-                <!-- Highlighted Provenance Preview Pane -->
-                <Border Grid.Row="4" Background="#FFFFFF" CornerRadius="6" BorderBrush="#CBD5E1" BorderThickness="1" Padding="10">
-                    <DockPanel>
-                        <DockPanel DockPanel.Dock="Top" Margin="0,0,0,6">
-                            <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" VerticalAlignment="Center">
-                                <Button x:Name="BtnPrevHit" Content="◀ 上一处" Click="BtnPrevHit_Click" Padding="6,2" FontSize="11" />
-                                <TextBlock x:Name="HitNavText" Text="0 / 0" VerticalAlignment="Center" Margin="6,0" FontSize="11" Foreground="#475569" />
-                                <Button x:Name="BtnNextHit" Content="下一处 ▶" Click="BtnNextHit_Click" Padding="6,2" FontSize="11" Margin="0,0,8,0" />
-                                <Button Content="打开文件" Click="MenuOpenFile_Click" Padding="8,2" FontSize="11" Margin="0,0,4,0" />
-                                <Button Content="打开所在目录" Click="MenuOpenFolder_Click" Padding="8,2" FontSize="11" Margin="0,0,4,0" />
-                                <Button Content="深度删除" Click="MenuDeepDeleteSelected_Click" Padding="8,2" FontSize="11" Foreground="#B91C1C" BorderBrush="#FCA5A5" Background="#FEF2F2" />
-                            </StackPanel>
-                            <TextBlock x:Name="PreviewHeader" Text="原文与 OCR 分段高亮预览"
-                                       FontWeight="SemiBold" FontSize="12" Foreground="#0F172A" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
-                        </DockPanel>
-                        <RichTextBox x:Name="PreviewBox" IsReadOnly="True" VerticalScrollBarVisibility="Auto"
-                                     HorizontalScrollBarVisibility="Auto" BorderBrush="#E2E8F0" Background="#FAFAFA"
-                                     FontFamily="Consolas, Microsoft YaHei UI" FontSize="12" />
-                    </DockPanel>
-                </Border>
-            </Grid>
+                            <DockPanel Grid.Row="0" LastChildFill="True">
+                                <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="6,0,0,0">
+                                    <Button x:Name="BtnPrevHit" Content="◀ 上一处" Click="BtnPrevHit_Click" Height="24" Padding="7,0" Margin="0,0,4,0" FontSize="11" VerticalAlignment="Center" ToolTip="跳转到上一处关键字 (Shift+F3)" />
+                                    <TextBlock x:Name="HitNavText" Text="0 / 0" VerticalAlignment="Center" Margin="4,0" FontSize="11.5" FontWeight="SemiBold" Foreground="#1E293B" />
+                                    <Button x:Name="BtnNextHit" Content="下一处 ▶" Click="BtnNextHit_Click" Height="24" Padding="7,0" Margin="4,0,8,0" FontSize="11" VerticalAlignment="Center" ToolTip="跳转到下一处关键字 (F3)" />
+                                    <Button Content="打开" Click="MenuOpenFile_Click" Height="24" Padding="8,0" FontSize="11" Margin="0,0,4,0" VerticalAlignment="Center" />
+                                    <Button Content="目录" Click="MenuOpenFolder_Click" Height="24" Padding="8,0" FontSize="11" Margin="0,0,4,0" VerticalAlignment="Center" />
+                                    <Button Content="深度删除" Style="{StaticResource DangerOutlineButton}" Click="MenuDeepDeleteSelected_Click" Height="24" Padding="8,0" Margin="0" FontSize="11" VerticalAlignment="Center" />
+                                </StackPanel>
+                                <TextBlock x:Name="PreviewHeader" Text="文件内容预览"
+                                           FontWeight="SemiBold" FontSize="12.5" Foreground="#0F172A"
+                                           VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                            </DockPanel>
+
+                            <TextBlock x:Name="PreviewSubHeader" Grid.Row="1"
+                                       Text="单击左侧列表中的任意文件，右侧将自动加载并聚焦定位到搜索关键字所在位置"
+                                       FontSize="11" Foreground="#64748B" Margin="0,3,0,0" TextTrimming="CharacterEllipsis" />
+                        </Grid>
+                    </Border>
+
+                    <RichTextBox x:Name="PreviewBox" IsReadOnly="True" IsDocumentEnabled="True"
+                                 VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                                 BorderThickness="0" Background="#FFFFFF" Padding="8"
+                                 FontFamily="Consolas, Microsoft YaHei UI" FontSize="12.5" />
+                </DockPanel>
+            </Border>
         </Grid>
 
-        <!-- Bottom Progress Footer -->
-        <Border Grid.Row="2" Background="#E2E8F0" Padding="12,6" BorderBrush="#CBD5E1" BorderThickness="0,1,0,0">
-            <DockPanel>
-                <ProgressBar x:Name="ScanProgressBar" DockPanel.Dock="Right" Width="200" Height="14" IsIndeterminate="False" Value="0" Maximum="100" />
-                <TextBlock x:Name="FooterStatusText" Text="就绪" FontSize="12" Foreground="#334155" TextTrimming="CharacterEllipsis" />
+        <!-- Row 4: Everything-style Status Bar + Quick Toggle Pills -->
+        <Border Grid.Row="4" Background="#F1F5F9" BorderBrush="#CBD5E1" BorderThickness="0,1,0,0" Padding="10,4">
+            <DockPanel LastChildFill="True">
+                <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" VerticalAlignment="Center">
+                    <TextBlock x:Name="PillMultiLogic" Text="多词: AND" FontSize="11" Foreground="#1E40AF" Background="#DBEAFE"
+                               Padding="7,2" Margin="0,0,6,0" Cursor="Hand"
+                               MouseLeftButtonUp="PillMultiLogic_Click" ToolTip="点击切换多关键词匹配逻辑：AND(全部包含) / OR(任一命中)" />
+                    <TextBlock x:Name="PillScope" Text="字段: 全部" FontSize="11" Foreground="#334155" Background="#E2E8F0"
+                               Padding="7,2" Margin="0,0,6,0" Cursor="Hand"
+                               MouseLeftButtonUp="PillScope_Click" ToolTip="点击切换限定搜索字段" />
+                    <TextBlock x:Name="PillRegex" Text="正则" FontSize="11" Foreground="#64748B" Background="#E2E8F0"
+                               Padding="7,2" Margin="0,0,6,0" Cursor="Hand"
+                               MouseLeftButtonUp="PillRegex_Click" ToolTip="点击开关正则表达式匹配" />
+                    <TextBlock x:Name="PillExpr" Text="表达式" FontSize="11" Foreground="#64748B" Background="#E2E8F0"
+                               Padding="7,2" Margin="0,0,6,0" Cursor="Hand"
+                               MouseLeftButtonUp="PillExpr_Click" ToolTip="点击开关高级布尔/邻近表达式 (NEAR / scope:)" />
+                    <TextBlock x:Name="PillOcr" Text="OCR: 开" FontSize="11" Foreground="#065F46" Background="#D1FAE5"
+                               Padding="7,2" Margin="0,0,8,0" Cursor="Hand"
+                               MouseLeftButtonUp="PillOcr_Click" ToolTip="点击开关图片与内嵌图 OCR 识别" />
+
+                    <Button x:Name="BtnFooterCancel" Content="停止任务" Visibility="Collapsed"
+                            Click="MenuCancelJob_Click" Padding="6,1" FontSize="11" Margin="0,0,6,0" />
+                    <ProgressBar x:Name="ScanProgressBar" Width="120" Height="12" IsIndeterminate="False" Value="0" Maximum="100" VerticalAlignment="Center" />
+                </StackPanel>
+
+                <TextBlock x:Name="FooterStatusText" Text="就绪" FontSize="11.5" Foreground="#334155"
+                           VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Margin="0,0,10,0" />
             </DockPanel>
         </Border>
     </Grid>

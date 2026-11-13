@@ -41,6 +41,8 @@ pub struct ParseOptions {
     pub ocr_min_image_dim: u32,
     pub enable_x2t: bool,
     pub passwords: Vec<String>,
+    #[serde(default)]
+    pub extract_deferred_images: bool,
 }
 
 impl Default for ParseOptions {
@@ -54,8 +56,20 @@ impl Default for ParseOptions {
             ocr_min_image_dim: 24,
             enable_x2t: false,
             passwords: Vec::new(),
+            extract_deferred_images: false,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredOcrImage {
+    pub doc_virtual_path: String,
+    pub label: String,
+    pub img_blake3: String,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    #[serde(default)]
+    pub staged_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +92,25 @@ pub enum WorkerRequest {
     },
     WarmOcrCache {
         entries: Vec<(String, String)>,
+    },
+    OcrImageBytes {
+        task_id: u64,
+        label: String,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        min_dim: u32,
+    },
+    OcrPdfPages {
+        task_id: u64,
+        disk_path: String,
+        passwords: Vec<String>,
+        page_indices: Vec<usize>,
+        min_dim: u32,
+    },
+    ParseFilesBatch {
+        task_id: u64,
+        items: Vec<(String, String)>, // (disk_path, virtual_path)
+        options: ParseOptions,
     },
 }
 
@@ -114,6 +147,18 @@ pub enum WorkerResponse {
         child_docs: Vec<ExtractedDocument>,
         #[serde(default)]
         new_ocr_entries: Vec<(String, u32, u32, String)>,
+        #[serde(default)]
+        deferred_images: Vec<DeferredOcrImage>,
+        #[serde(default)]
+        deferred_pdf_pages: Vec<usize>,
+    },
+    OcrCompleted {
+        task_id: u64,
+        segments: Vec<TextSegment>,
+        #[serde(default)]
+        warnings: Vec<String>,
+        #[serde(default)]
+        new_ocr_entries: Vec<(String, u32, u32, String)>,
     },
     Failed {
         task_id: u64,
@@ -121,4 +166,54 @@ pub enum WorkerResponse {
         kind: FailureKind,
         detail: String,
     },
+    ParsedBatch {
+        task_id: u64,
+        items: Vec<WorkerResponse>,
+    },
+}
+
+/// Extensions whose contents are non-document OS/compiler binaries or oversized BIM/installer assets;
+/// indexed purely by filename/path/size metadata without expensive disk reads or unpackers.
+pub fn is_metadata_only_binary_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "dll" | "exe" | "sys" | "drv" | "ocx" | "cpl" | "tlb" | "pdb" | "lib" | "obj"
+            | "o" | "a" | "cat" | "mui" | "winmd" | "pri" | "pnf" | "cdf-ms" | "mfl"
+            | "msi" | "msu" | "msp" | "mst" | "mum" | "rvt" | "nwc" | "nwd" | "rfa"
+            | "dwf" | "ttf" | "otf" | "woff" | "woff2" | "db-wal" | "db-shm"
+            | "ico" | "sbx" | "shx" | "sbn"
+    )
+}
+
+/// Pure raster image formats whose searchable content relies on OCR and can be deferred to Pass 2.
+pub fn is_ocr_image_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "bmp" | "webp" | "tif" | "tiff" | "heic" | "heif" | "avif" | "gif"
+    )
+}
+
+pub fn build_metadata_only_doc(
+    file_name: String,
+    virtual_path: &str,
+    detected_format: &str,
+    byte_size: u64,
+    blake3_hex: String,
+    warning: impl Into<String>,
+) -> ExtractedDocument {
+    ExtractedDocument {
+        virtual_path: virtual_path.to_string(),
+        file_name,
+        detected_format: if detected_format.is_empty() {
+            "bin".into()
+        } else {
+            detected_format.to_string()
+        },
+        blake3_hex,
+        byte_size,
+        encrypted: false,
+        segments: Vec::new(),
+        metadata: vec![("indexed_mode".into(), "metadata_only".into())],
+        warnings: vec![warning.into()],
+    }
 }

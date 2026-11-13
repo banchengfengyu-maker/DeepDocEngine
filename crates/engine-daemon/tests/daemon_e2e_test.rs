@@ -334,6 +334,8 @@ mod windows_e2e {
                     use_regex: false,
                     file_ext_filter: Some("txt".into()),
                     options: scan_opts.clone(),
+                    match_all_terms: true,
+                    cancel_active_jobs: false,
                 },
             },
         )
@@ -410,7 +412,7 @@ mod windows_e2e {
                     job_id: "job-sub".into(),
                     roots: vec![sub_dir.to_string_lossy().into_owned()],
                     ruleset: None,
-                    options: scan_opts,
+                    options: scan_opts.clone(),
                 },
             },
         )
@@ -458,6 +460,7 @@ mod windows_e2e {
                 request: ClientRequest::DeepDeleteFiles {
                     job_id: "job-del".into(),
                     paths: vec![victim_file.to_string_lossy().into_owned()],
+                    cancel_active_jobs: false,
                 },
             },
         )
@@ -518,11 +521,210 @@ mod windows_e2e {
             other => panic!("expected Ack for ResetIndexKeepOcr, got {other:?}"),
         }
 
-        // 9. Shutdown cleanly
+        // 8b. Verify Two-Phase Queue: Fast Pass completes & is immediately searchable before Pass 2 OCR finishes
+        let two_phase_dir = tmp_root.join("two_phase");
+        std::fs::create_dir_all(&two_phase_dir).unwrap();
+        std::fs::write(
+            two_phase_dir.join("fast_doc.txt"),
+            b"FAST_PASS_IMMEDIATE_SEARCH_KEY_9981",
+        )
+        .unwrap();
+        // Minimal valid 1x1 PNG file so Pass 1 defers it to Pass 2 OCR queue
+        let tiny_png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
+            0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(two_phase_dir.join("deferred_pic.png"), tiny_png).unwrap();
+
+        let mut ocr_scan_opts = ScanOptions::default();
+        ocr_scan_opts.parse.enable_ocr = true;
         write_frame_async(
             &mut writer,
             &ClientEnvelope {
                 req_id: 16,
+                request: ClientRequest::StartScan {
+                    job_id: "job-ocr-2".into(),
+                    roots: vec![two_phase_dir.to_string_lossy().into_owned()],
+                    ruleset: None,
+                    options: ocr_scan_opts,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut saw_fast_pass = false;
+        loop {
+            match read_frame_async::<_, DaemonMessage>(&mut reader).await.unwrap() {
+                DaemonMessage::Ack { ok, .. } => assert!(ok),
+                DaemonMessage::ScanProgress { .. } | DaemonMessage::ScanHit { .. } => {}
+                DaemonMessage::ScanFastPassCompleted {
+                    fast_parsed_ok,
+                    deferred_ocr_count,
+                    ..
+                } => {
+                    assert!(!saw_fast_pass);
+                    saw_fast_pass = true;
+                    assert_eq!(deferred_ocr_count, 1);
+                    assert_eq!(fast_parsed_ok, 1);
+
+                    // Verify Fast Pass documents are immediately searchable via a concurrent pipe before Pass 2 finishes
+                    let pipe2 = ClientOptions::new().open(&pipe_name).expect("open 2nd pipe");
+                    let (mut r2, mut w2) = tokio::io::split(pipe2);
+                    write_frame_async(
+                        &mut w2,
+                        &ClientEnvelope {
+                            req_id: 101,
+                            request: ClientRequest::Search {
+                                query: SearchQuery {
+                                    text: "FAST_PASS_IMMEDIATE_SEARCH_KEY_9981".into(),
+                                    ..Default::default()
+                                },
+                            },
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    match read_frame_async::<_, DaemonMessage>(&mut r2).await.unwrap() {
+                        DaemonMessage::SearchResult { total_hits, .. } => {
+                            assert_eq!(total_hits, 1, "Fast Pass text must be searchable right after ScanFastPassCompleted");
+                        }
+                        other => panic!("expected SearchResult right after fast pass, got {other:?}"),
+                    }
+                }
+                DaemonMessage::ScanCompleted { summary, .. } => {
+                    assert!(saw_fast_pass, "expected ScanFastPassCompleted before ScanCompleted");
+                    assert_eq!(summary.parsed_ok, 2);
+                    assert_eq!(summary.failed_files, 0);
+                    break;
+                }
+                other => panic!("unexpected during two-phase scan: {other:?}"),
+            }
+        }
+
+        // 8c. Verify Deep Confidentiality Check (OR keywords + preemption + folder erase)
+        let secret_dir = tmp_root.join("secret_audit_folder");
+        std::fs::create_dir_all(secret_dir.join("sub")).unwrap();
+        std::fs::write(
+            secret_dir.join("sub/memo.txt"),
+            "项目沟通纪要：本件属于内部资料，请勿转发。".as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            secret_dir.join("public_notice.txt"),
+            "这是完全公开的通知公告，不包含任何敏感标识。".as_bytes(),
+        )
+        .unwrap();
+
+        write_frame_async(
+            &mut writer,
+            &ClientEnvelope {
+                req_id: 17,
+                request: ClientRequest::DirectSearch {
+                    job_id: "job-deep-check-1".into(),
+                    roots: vec![secret_dir.to_string_lossy().into_owned()],
+                    query: "秘密 机密 绝密 内部文件 内部资料 不公开".into(),
+                    use_regex: false,
+                    file_ext_filter: None,
+                    options: scan_opts.clone(),
+                    match_all_terms: false,
+                    cancel_active_jobs: true,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut secret_hits = Vec::new();
+        loop {
+            match read_frame_async::<_, DaemonMessage>(&mut reader).await.unwrap() {
+                DaemonMessage::Ack { ok, .. } => assert!(ok),
+                DaemonMessage::ScanProgress { .. } => {}
+                DaemonMessage::ScanHit { hit, .. } => secret_hits.push(hit),
+                DaemonMessage::ScanCompleted { summary, .. } => {
+                    assert_eq!(summary.rule_hits, 1);
+                    break;
+                }
+                other => panic!("unexpected during deep check: {other:?}"),
+            }
+        }
+        assert_eq!(secret_hits.len(), 1);
+        assert_eq!(secret_hits[0].file_name, "memo.txt");
+
+        // Now verify recursive Deep Erase on the entire folder
+        write_frame_async(
+            &mut writer,
+            &ClientEnvelope {
+                req_id: 18,
+                request: ClientRequest::DeepDeleteFiles {
+                    job_id: "job-del-dir".into(),
+                    paths: vec![secret_dir.to_string_lossy().into_owned()],
+                    cancel_active_jobs: true,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        loop {
+            match read_frame_async::<_, DaemonMessage>(&mut reader).await.unwrap() {
+                DaemonMessage::Ack { ok, .. } => assert!(ok),
+                DaemonMessage::DeepDeleteProgress { .. } => {}
+                DaemonMessage::DeepDeleteCompleted {
+                    deleted_files,
+                    skipped_or_failed,
+                    ..
+                } => {
+                    assert_eq!(deleted_files, 2);
+                    assert_eq!(skipped_or_failed, 0);
+                    break;
+                }
+                other => panic!("unexpected during dir DeepDeleteFiles: {other:?}"),
+            }
+        }
+        assert!(!secret_dir.exists(), "secret_dir and all nested subdirectories must be wiped");
+
+        // 8d. Verify Low-Resource Mode StartScan (`low_resource_mode: true`, single idle-priority worker)
+        let low_dir = tmp_root.join("low_res_rebuild");
+        std::fs::create_dir_all(&low_dir).unwrap();
+        std::fs::write(low_dir.join("gentle.txt"), b"LOW_RESOURCE_REBUILD_VERIFIED_77").unwrap();
+        let mut low_opts = scan_opts.clone();
+        low_opts.low_resource_mode = true;
+        low_opts.worker_count = 1;
+        write_frame_async(
+            &mut writer,
+            &ClientEnvelope {
+                req_id: 19,
+                request: ClientRequest::StartScan {
+                    job_id: "rebuild-low-test".into(),
+                    roots: vec![low_dir.to_string_lossy().into_owned()],
+                    ruleset: None,
+                    options: low_opts,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        loop {
+            match read_frame_async::<_, DaemonMessage>(&mut reader).await.unwrap() {
+                DaemonMessage::Ack { ok, .. } => assert!(ok),
+                DaemonMessage::ScanProgress { .. } | DaemonMessage::ScanHit { .. } => {}
+                DaemonMessage::ScanCompleted { summary, .. } => {
+                    assert_eq!(summary.parsed_ok, 1);
+                    assert_eq!(summary.failed_files, 0);
+                    break;
+                }
+                other => panic!("unexpected during low-resource scan: {other:?}"),
+            }
+        }
+
+        // 9. Shutdown cleanly
+        write_frame_async(
+            &mut writer,
+            &ClientEnvelope {
+                req_id: 20,
                 request: ClientRequest::Shutdown,
             },
         )

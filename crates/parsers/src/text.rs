@@ -31,27 +31,47 @@ pub fn decode_text_auto(bytes: &[u8]) -> (String, &'static str) {
 /// Extract first 10 non-empty lines and last 10 non-empty lines into a `HeadTail` segment
 /// to directly support official document classification / red-header regex rules.
 pub fn build_head_tail_segment(text: &str) -> Option<TextSegment> {
-    let lines: Vec<&str> = text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect();
-    if lines.is_empty() {
-        return None;
-    }
+    let base = text.as_ptr() as usize;
     let mut out = String::new();
-    let head_end = lines.len().min(10);
-    for l in &lines[..head_end] {
+    let mut head_count = 0usize;
+    let mut head_end_byte = 0usize;
+
+    for raw in text.lines() {
+        let l = raw.trim();
+        if l.is_empty() {
+            continue;
+        }
         out.push_str(l);
         out.push('\n');
+        head_count += 1;
+        if head_count >= 10 {
+            head_end_byte = (raw.as_ptr() as usize - base + raw.len()).min(text.len());
+            break;
+        }
     }
-    if lines.len() > 10 {
-        let tail_start = lines.len().saturating_sub(10).max(head_end);
-        for l in &lines[tail_start..] {
+    if head_count == 0 {
+        return None;
+    }
+
+    if head_count >= 10 && head_end_byte < text.len() {
+        let rest = &text[head_end_byte..];
+        let mut tail_rev: Vec<&str> = Vec::with_capacity(10);
+        for raw in rest.rsplit('\n') {
+            let l = raw.trim();
+            if l.is_empty() {
+                continue;
+            }
+            tail_rev.push(l);
+            if tail_rev.len() >= 10 {
+                break;
+            }
+        }
+        for l in tail_rev.into_iter().rev() {
             out.push_str(l);
             out.push('\n');
         }
     }
+
     Some(TextSegment {
         scope: SegmentScope::HeadTail,
         location_label: "文档首尾行 (前10/后10行)".to_string(),
@@ -108,11 +128,22 @@ pub fn extract_xml_text(xml_bytes: &[u8]) -> String {
                 }
             }
             Ok(Event::End(e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_ascii_lowercase();
-                if matches!(tag.as_str(), "p" | "tr" | "row" | "div" | "li" | "br" | "h1" | "h2" | "h3" | "w:p" | "text:p") {
-                    if !out.ends_with('\n') {
-                        out.push('\n');
-                    }
+                let raw = e.name();
+                let nb = raw.as_ref();
+                if (nb.eq_ignore_ascii_case(b"p")
+                    || nb.eq_ignore_ascii_case(b"tr")
+                    || nb.eq_ignore_ascii_case(b"row")
+                    || nb.eq_ignore_ascii_case(b"div")
+                    || nb.eq_ignore_ascii_case(b"li")
+                    || nb.eq_ignore_ascii_case(b"br")
+                    || nb.eq_ignore_ascii_case(b"h1")
+                    || nb.eq_ignore_ascii_case(b"h2")
+                    || nb.eq_ignore_ascii_case(b"h3")
+                    || nb.eq_ignore_ascii_case(b"w:p")
+                    || nb.eq_ignore_ascii_case(b"text:p"))
+                    && !out.ends_with('\n')
+                {
+                    out.push('\n');
                 }
             }
             Ok(Event::Eof) | Err(_) => break,

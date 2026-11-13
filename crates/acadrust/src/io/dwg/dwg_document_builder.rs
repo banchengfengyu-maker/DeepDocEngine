@@ -93,8 +93,47 @@ pub struct DwgDocumentBuilder {
     obj_reader: DwgObjectReader,
     /// Whether to use failsafe mode (report skipped records via notifications).
     failsafe: bool,
+    /// When true, non-text geometric entities (lines, circles, polylines, hatches) are skipped.
+    text_entities_only: bool,
     /// Notifications collected during building.
     notifications: NotificationCollection,
+}
+
+#[inline]
+fn is_non_text_entity(type_code: i16) -> bool {
+    matches!(
+        type_code,
+        OBJ_LINE
+            | OBJ_POINT
+            | OBJ_CIRCLE
+            | OBJ_ARC
+            | OBJ_ELLIPSE
+            | OBJ_RAY
+            | OBJ_XLINE
+            | OBJ_SOLID
+            | OBJ_TRACE
+            | OBJ_3DFACE
+            | OBJ_SHAPE
+            | OBJ_LWPOLYLINE
+            | OBJ_SPLINE
+            | OBJ_HATCH
+            | OBJ_VIEWPORT
+            | OBJ_POLYLINE_2D
+            | OBJ_POLYLINE_3D
+            | OBJ_MLINE
+            | OBJ_POLYLINE_PFACE
+            | OBJ_MESH
+            | OBJ_SEQEND
+            | OBJ_VERTEX_2D
+            | OBJ_VERTEX_3D
+            | OBJ_VERTEX_MESH
+            | OBJ_VERTEX_PFACE
+            | OBJ_VERTEX_PFACE_FACE
+            | OBJ_POLYLINE_MESH
+            | OBJ_3DSOLID
+            | OBJ_REGION
+            | OBJ_BODY
+    )
 }
 
 impl DwgDocumentBuilder {
@@ -103,6 +142,7 @@ impl DwgDocumentBuilder {
         Self {
             obj_reader,
             failsafe: false,
+            text_entities_only: false,
             notifications: NotificationCollection::new(),
         }
     }
@@ -113,6 +153,13 @@ impl DwgDocumentBuilder {
     /// instead of being silently lost.
     pub fn set_failsafe(&mut self, failsafe: bool) {
         self.failsafe = failsafe;
+    }
+
+    /// Enable or disable text-entities-only mode.
+    ///
+    /// When enabled, pure geometric entities are skipped at the stream level without struct allocations.
+    pub fn set_text_entities_only(&mut self, text_only: bool) {
+        self.text_entities_only = text_only;
     }
 
     /// Build the document by iterating all handles and dispatching objects.
@@ -977,6 +1024,9 @@ impl DwgDocumentBuilder {
             is_entity_type(type_code)
         };
         if is_entity {
+            if self.text_entities_only && is_non_text_entity(type_code) {
+                return;
+            }
             let entity_data = self.obj_reader.read_common_entity_data(&mut reader, type_code);
             let entity_common = map_entity_common(
                 &entity_data,

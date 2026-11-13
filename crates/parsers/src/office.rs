@@ -13,6 +13,10 @@ pub struct OfficeParseResult {
 }
 
 pub fn parse_spreadsheet_calamine(bytes: &[u8]) -> OfficeParseResult {
+    parse_spreadsheet_calamine_opt(bytes, true)
+}
+
+pub fn parse_spreadsheet_calamine_opt(bytes: &[u8], extract_media: bool) -> OfficeParseResult {
     let mut res = OfficeParseResult {
         segments: Vec::new(),
         embedded_images: Vec::new(),
@@ -61,16 +65,24 @@ pub fn parse_spreadsheet_calamine(bytes: &[u8]) -> OfficeParseResult {
         }
     }
 
-    // Also extract embedded images in xl/media/* if it's a zip-based workbook
-    if let Ok(mut zip) = ZipArchive::new(Cursor::new(bytes)) {
-        extract_zip_media(&mut zip, "xl/media/", &mut res.embedded_images);
-        extract_zip_embeddings(&mut zip, "xl/embeddings/", &mut res.embedded_files);
+    // Also extract embedded images/embeddings in xl/* if it's a zip-based workbook (PK magic check skips XLS/binary overhead)
+    if bytes.starts_with(b"PK") {
+        if let Ok(mut zip) = ZipArchive::new(Cursor::new(bytes)) {
+            if extract_media {
+                extract_zip_media(&mut zip, "xl/media/", &mut res.embedded_images);
+            }
+            extract_zip_embeddings(&mut zip, "xl/embeddings/", &mut res.embedded_files);
+        }
     }
 
     res
 }
 
 pub fn parse_docx(bytes: &[u8]) -> OfficeParseResult {
+    parse_docx_opt(bytes, true)
+}
+
+pub fn parse_docx_opt(bytes: &[u8], extract_media: bool) -> OfficeParseResult {
     let mut res = OfficeParseResult {
         segments: Vec::new(),
         embedded_images: Vec::new(),
@@ -130,12 +142,18 @@ pub fn parse_docx(bytes: &[u8]) -> OfficeParseResult {
         res.segments.insert(0, ht);
     }
 
-    extract_zip_media(&mut zip, "word/media/", &mut res.embedded_images);
+    if extract_media {
+        extract_zip_media(&mut zip, "word/media/", &mut res.embedded_images);
+    }
     extract_zip_embeddings(&mut zip, "word/embeddings/", &mut res.embedded_files);
     res
 }
 
 pub fn parse_pptx(bytes: &[u8]) -> OfficeParseResult {
+    parse_pptx_opt(bytes, true)
+}
+
+pub fn parse_pptx_opt(bytes: &[u8], extract_media: bool) -> OfficeParseResult {
     let mut res = OfficeParseResult {
         segments: Vec::new(),
         embedded_images: Vec::new(),
@@ -196,7 +214,9 @@ pub fn parse_pptx(bytes: &[u8]) -> OfficeParseResult {
         }
     }
 
-    extract_zip_media(&mut zip, "ppt/media/", &mut res.embedded_images);
+    if extract_media {
+        extract_zip_media(&mut zip, "ppt/media/", &mut res.embedded_images);
+    }
     extract_zip_embeddings(&mut zip, "ppt/embeddings/", &mut res.embedded_files);
     res
 }

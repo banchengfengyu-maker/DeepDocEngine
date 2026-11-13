@@ -161,6 +161,7 @@ pub fn convert_via_onlyoffice_x2t(
 pub struct PdfParseOutcome {
     pub segments: Vec<TextSegment>,
     pub embedded_images: Vec<(String, Vec<u8>)>,
+    pub deferred_scan_pages: Vec<usize>,
     pub encrypted_locked: bool,
     pub warnings: Vec<String>,
 }
@@ -171,14 +172,172 @@ pub struct PdfParseOutcome {
 ///    and embedded XObject image extraction);
 /// 3. Falls back to raw stream scanner if `lopdf` hits a malformed PDF.
 pub fn parse_pdf_document(bytes: &[u8], passwords: &[String]) -> PdfParseOutcome {
+    parse_pdf_document_mode(bytes, passwords, true)
+}
+
+/// Parse PDF with explicit control over whether scanned pages (< 20 text chars) are bitmap-rendered
+/// immediately (`render_scan_pages = true`) or recorded as `deferred_scan_pages` for Stage-2 OCR.
+pub fn parse_pdf_document_mode(
+    bytes: &[u8],
+    passwords: &[String],
+    render_scan_pages: bool,
+) -> PdfParseOutcome {
+    parse_pdf_document_mode_ext(bytes, passwords, render_scan_pages, true)
+}
+
+fn decode_pdf_raw_bytes(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xFE, 0xFF]) && bytes.len() >= 2 {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn extract_pdf_with_pdf_oxide(
+    bytes: &[u8],
+    passwords: &[String],
+) -> Result<PdfParseOutcome, String> {
+    let doc = pdf_oxide::PdfDocument::from_bytes(bytes.to_vec())
+        .map_err(|e| format!("pdf_oxide init error: {e}"))?;
+
+    if doc.is_encrypted() {
+        let mut unlocked = false;
+        for pw in passwords {
+            if doc.authenticate(pw.as_bytes()).unwrap_or(false) {
+                unlocked = true;
+                break;
+            }
+        }
+        if !unlocked {
+            return Ok(PdfParseOutcome {
+                segments: Vec::new(),
+                embedded_images: Vec::new(),
+                deferred_scan_pages: Vec::new(),
+                encrypted_locked: true,
+                warnings: vec!["PDF 已加密受保护，未提供匹配密码（pdf_oxide）".into()],
+            });
+        }
+    }
+
+    let page_count = doc.page_count().unwrap_or(0);
+    if page_count == 0 {
+        return Err("empty pages".into());
+    }
+
+    let mut segments = Vec::new();
+    let mut deferred_scan_pages = Vec::new();
+
+    // Extract Document Information (Title, Author, Subject, Keywords, Creator, Producer)
+    let mut meta_lines = Vec::new();
+    if let Some(trailer_dict) = doc.trailer().as_dict() {
+        if let Some(info_obj) = trailer_dict.get("Info") {
+            if let Ok(resolved_info) = doc.resolve_references(info_obj, 3) {
+                if let Some(info_dict) = resolved_info.as_dict() {
+                    for key in ["Title", "Author", "Subject", "Keywords", "Creator", "Producer"] {
+                        if let Some(val_obj) = info_dict.get(key) {
+                            if let Ok(resolved_val) = doc.resolve_references(val_obj, 3) {
+                                if let Some(bytes) = resolved_val.as_string() {
+                                    let s = decode_pdf_raw_bytes(bytes);
+                                    let trimmed = s.trim();
+                                    if !trimmed.is_empty() {
+                                        meta_lines.push(format!("{key}: {trimmed}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !meta_lines.is_empty() {
+        segments.push(TextSegment {
+            scope: SegmentScope::Metadata,
+            location_label: "PDF 文档信息".into(),
+            text: meta_lines.join("\n"),
+        });
+    }
+
+    for page_idx in 0..page_count {
+        let text = doc.extract_text(page_idx).unwrap_or_default();
+        let trimmed = text.trim();
+        let char_count = trimmed.chars().count();
+
+        if char_count < 20 {
+            deferred_scan_pages.push(page_idx);
+        }
+
+        if !trimmed.is_empty() {
+            segments.push(TextSegment {
+                scope: SegmentScope::Body,
+                location_label: format!("第 {} 页", page_idx + 1),
+                text,
+            });
+        }
+    }
+
+    if let Some(first_seg) = segments.iter().find(|s| s.scope == SegmentScope::Body) {
+        if let Some(ht) = build_head_tail_segment(&first_seg.text) {
+            segments.insert(0, ht);
+        }
+    }
+
+    Ok(PdfParseOutcome {
+        segments,
+        embedded_images: Vec::new(),
+        deferred_scan_pages,
+        encrypted_locked: false,
+        warnings: Vec::new(),
+    })
+}
+
+pub fn parse_pdf_document_mode_ext(
+    bytes: &[u8],
+    passwords: &[String],
+    render_scan_pages: bool,
+    extract_images: bool,
+) -> PdfParseOutcome {
+    // 1. Ultra-fast pure-Rust pdf_oxide parser (0.8ms mean, zero C++ DLL / lock contention)
+    if let Ok(mut outcome) = extract_pdf_with_pdf_oxide(bytes, passwords) {
+        if outcome.encrypted_locked {
+            return outcome;
+        }
+
+        #[cfg(windows)]
+        if render_scan_pages && !outcome.deferred_scan_pages.is_empty() {
+            if let Ok(rendered) = render_pdf_scan_pages(bytes, passwords, &outcome.deferred_scan_pages) {
+                outcome.embedded_images.extend(rendered);
+            }
+        }
+
+        #[cfg(windows)]
+        if extract_images
+            && bytes.len() <= 16 * 1024 * 1024
+            && outcome.embedded_images.is_empty()
+        {
+            if let Ok(doc) = load_lopdf_with_passwords(bytes, passwords) {
+                collect_lopdf_xobject_images(&doc, &mut outcome.embedded_images);
+            }
+        }
+
+        if !outcome.segments.is_empty() || !outcome.deferred_scan_pages.is_empty() {
+            return outcome;
+        }
+    }
+
     #[cfg(windows)]
     if let Some(dll_path) = find_pdfium_dll() {
-        match extract_pdf_with_pdfium(&dll_path, bytes, passwords) {
+        match extract_pdf_with_pdfium(&dll_path, bytes, passwords, render_scan_pages) {
             Ok(mut outcome) => {
-                // Only inspect XObject images via lopdf on moderate-sized PDFs when PDFium yielded no scan/raster images
-                if !outcome.encrypted_locked
+                // Only run secondary lopdf XObject image inspection when image/OCR extraction is actually requested
+                if extract_images
+                    && !outcome.encrypted_locked
                     && bytes.len() <= 16 * 1024 * 1024
                     && outcome.embedded_images.is_empty()
+                    && outcome.deferred_scan_pages.is_empty()
                 {
                     if let Ok(doc) = load_lopdf_with_passwords(bytes, passwords) {
                         collect_lopdf_xobject_images(&doc, &mut outcome.embedded_images);
@@ -196,6 +355,49 @@ pub fn parse_pdf_document(bytes: &[u8], passwords: &[String]) -> PdfParseOutcome
     }
 
     extract_pdf_with_lopdf(bytes, passwords)
+}
+
+/// Render specific 0-based PDF page indices to PNGs for Stage-2 OCR (shared PDFium pipeline).
+pub fn render_pdf_scan_pages(
+    bytes: &[u8],
+    passwords: &[String],
+    page_indices: &[usize],
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    #[cfg(windows)]
+    {
+        let Some(dll_path) = find_pdfium_dll() else {
+            return Ok(Vec::new());
+        };
+        let _pdfium_guard = PDFIUM_LOCK
+            .lock()
+            .map_err(|_| "pdfium lock poisoned".to_string())?;
+        let api = get_pdfium_api(&dll_path)?;
+        let Some(doc) = open_pdfium_mem_doc(api, bytes, passwords)? else {
+            return Ok(Vec::new());
+        };
+        let page_count = unsafe { (api.count_pages)(doc) }.max(0) as usize;
+        let mut out = Vec::with_capacity(page_indices.len());
+        for &idx in page_indices {
+            if idx >= page_count {
+                continue;
+            }
+            let page = unsafe { (api.load_page)(doc, idx as std::ffi::c_int) };
+            if page.is_null() {
+                continue;
+            }
+            if let Some(png) = render_pdfium_page_png(api, page) {
+                out.push((format!("pdf_scan_page_{}.png", idx + 1), png));
+            }
+            unsafe { (api.close_page)(page) };
+        }
+        unsafe { (api.close_doc)(doc) };
+        Ok(out)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (bytes, passwords, page_indices);
+        Ok(Vec::new())
+    }
 }
 
 fn load_lopdf_with_passwords(bytes: &[u8], passwords: &[String]) -> Result<Document, String> {
@@ -227,6 +429,7 @@ fn extract_pdf_with_lopdf(bytes: &[u8], passwords: &[String]) -> PdfParseOutcome
     let mut outcome = PdfParseOutcome {
         segments: Vec::new(),
         embedded_images: Vec::new(),
+        deferred_scan_pages: Vec::new(),
         encrypted_locked: false,
         warnings: Vec::new(),
     };
@@ -491,48 +694,23 @@ fn get_pdfium_api(dll_path: &Path) -> Result<&'static PdfiumApi, String> {
 }
 
 #[cfg(windows)]
-fn extract_pdf_with_pdfium(
-    dll_path: &Path,
+static PDFIUM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(windows)]
+fn open_pdfium_mem_doc(
+    api: &PdfiumApi,
     bytes: &[u8],
     passwords: &[String],
-) -> Result<PdfParseOutcome, String> {
+) -> Result<Option<*mut std::ffi::c_void>, String> {
     use std::ffi::{c_int, c_void, CString};
-    use std::sync::Mutex;
-
-    // PDFium library init/destroy and page state are not re-entrant across concurrent threads.
-    static PDFIUM_LOCK: Mutex<()> = Mutex::new(());
-    let _pdfium_guard = PDFIUM_LOCK.lock().map_err(|_| "pdfium lock poisoned".to_string())?;
-    let api = get_pdfium_api(dll_path)?;
-
-    let f_load_mem = api.load_mem;
-    let f_close_doc = api.close_doc;
-    let f_count_pages = api.count_pages;
-    let f_get_meta = api.get_meta;
-    let f_load_page = api.load_page;
-    let f_close_page = api.close_page;
-    let f_page_w = api.page_w;
-    let f_page_h = api.page_h;
-    let f_text_load = api.text_load;
-    let f_text_close = api.text_close;
-    let f_text_count = api.text_count;
-    let f_text_get = api.text_get;
-    let f_bmp_create = api.bmp_create;
-    let f_bmp_fill = api.bmp_fill;
-    let f_bmp_render = api.bmp_render;
-    let f_bmp_buf = api.bmp_buf;
-    let f_bmp_stride = api.bmp_stride;
-    let f_bmp_destroy = api.bmp_destroy;
-    let f_last_err = api.last_err;
-
-    let mut doc = unsafe { f_load_mem(bytes.as_ptr() as *const c_void, bytes.len() as c_int, std::ptr::null()) };
-    let mut last_err = if doc.is_null() { unsafe { f_last_err() } } else { 0 };
+    let mut doc = unsafe { (api.load_mem)(bytes.as_ptr() as *const c_void, bytes.len() as c_int, std::ptr::null()) };
+    let mut last_err = if doc.is_null() { unsafe { (api.last_err)() } } else { 0 };
 
     if doc.is_null() && last_err == 4 {
-        // FPDF_ERR_PASSWORD: try empty password and configured password list
         for pwd in std::iter::once("").chain(passwords.iter().map(|s| s.as_str())) {
             if let Ok(cpwd) = CString::new(pwd) {
                 doc = unsafe {
-                    f_load_mem(
+                    (api.load_mem)(
                         bytes.as_ptr() as *const c_void,
                         bytes.len() as c_int,
                         cpwd.as_ptr(),
@@ -542,27 +720,101 @@ fn extract_pdf_with_pdfium(
                     last_err = 0;
                     break;
                 }
-                last_err = unsafe { f_last_err() };
+                last_err = unsafe { (api.last_err)() };
             }
         }
     }
 
     if doc.is_null() {
         if last_err == 4 {
-            return Ok(PdfParseOutcome {
-                segments: Vec::new(),
-                embedded_images: Vec::new(),
-                encrypted_locked: true,
-                warnings: vec!["PDF 受密码保护，配置密码均未解锁（PDFium）".into()],
-            });
+            return Ok(None);
         }
         return Err(format!("FPDF_LoadMemDocument error code {last_err}"));
     }
+    Ok(Some(doc))
+}
+
+#[cfg(windows)]
+fn render_pdfium_page_png(api: &PdfiumApi, page: *mut std::ffi::c_void) -> Option<Vec<u8>> {
+    use std::ffi::c_int;
+    let pw = unsafe { (api.page_w)(page) };
+    let ph = unsafe { (api.page_h)(page) };
+    let scale = 1.5f64;
+    let bw = (pw * scale).round().clamp(64.0, 1800.0) as c_int;
+    let bh = (ph * scale).round().clamp(64.0, 2400.0) as c_int;
+    let bmp = unsafe { (api.bmp_create)(bw, bh, 0) };
+    if bmp.is_null() {
+        return None;
+    }
+    let png_out = unsafe {
+        (api.bmp_fill)(bmp, 0, 0, bw, bh, 0xFFFF_FFFF);
+        (api.bmp_render)(bmp, page, 0, 0, bw, bh, 0, 0);
+        let ptr = (api.bmp_buf)(bmp);
+        let stride = (api.bmp_stride)(bmp) as usize;
+        let mut res = None;
+        if !ptr.is_null() && stride >= (bw as usize) * 4 {
+            let raw = std::slice::from_raw_parts(ptr, stride * (bh as usize));
+            let mut rgba = Vec::with_capacity((bw as usize) * (bh as usize) * 4);
+            for y in 0..(bh as usize) {
+                let row = &raw[y * stride..y * stride + (bw as usize) * 4];
+                for bgra in row.chunks_exact(4) {
+                    rgba.extend_from_slice(&[bgra[2], bgra[1], bgra[0], bgra[3]]);
+                }
+            }
+            if let Some(im) = image::RgbaImage::from_raw(bw as u32, bh as u32, rgba) {
+                let mut png_buf = Cursor::new(Vec::new());
+                if image::DynamicImage::ImageRgba8(im)
+                    .write_to(&mut png_buf, image::ImageFormat::Png)
+                    .is_ok()
+                {
+                    res = Some(png_buf.into_inner());
+                }
+            }
+        }
+        (api.bmp_destroy)(bmp);
+        res
+    };
+    png_out
+}
+
+#[cfg(windows)]
+fn extract_pdf_with_pdfium(
+    dll_path: &Path,
+    bytes: &[u8],
+    passwords: &[String],
+    render_scan_pages: bool,
+) -> Result<PdfParseOutcome, String> {
+    use std::ffi::{c_int, c_void, CString};
+
+    // PDFium library init/destroy and page state are not re-entrant across concurrent threads.
+    let _pdfium_guard = PDFIUM_LOCK.lock().map_err(|_| "pdfium lock poisoned".to_string())?;
+    let api = get_pdfium_api(dll_path)?;
+
+    let f_close_doc = api.close_doc;
+    let f_count_pages = api.count_pages;
+    let f_get_meta = api.get_meta;
+    let f_load_page = api.load_page;
+    let f_close_page = api.close_page;
+    let f_text_load = api.text_load;
+    let f_text_close = api.text_close;
+    let f_text_count = api.text_count;
+    let f_text_get = api.text_get;
+
+    let Some(doc) = open_pdfium_mem_doc(api, bytes, passwords)? else {
+        return Ok(PdfParseOutcome {
+            segments: Vec::new(),
+            embedded_images: Vec::new(),
+            deferred_scan_pages: Vec::new(),
+            encrypted_locked: true,
+            warnings: vec!["PDF 受密码保护，配置密码均未解锁（PDFium）".into()],
+        });
+    };
 
     let page_count = unsafe { f_count_pages(doc) }.max(0) as usize;
     let mut segments = Vec::new();
     let mut embedded_images = Vec::new();
-    let mut warnings = Vec::new();
+    let mut deferred_scan_pages = Vec::new();
+    let warnings = Vec::new();
     let mut all_text = String::new();
 
     let mut meta_lines = Vec::new();
@@ -596,10 +848,6 @@ fn extract_pdf_with_pdfium(
         });
     }
 
-    const MAX_SCAN_OCR_PAGES: usize = 8;
-    let mut scan_pages_rendered = 0usize;
-    let mut skipped_scan_pages = 0usize;
-
     for i in 0..page_count {
         let page = unsafe { f_load_page(doc, i as c_int) };
         if page.is_null() {
@@ -621,45 +869,12 @@ fn extract_pdf_with_pdfium(
 
         let trimmed = page_text.trim();
         if trimmed.chars().filter(|c| !c.is_whitespace()).count() < 20 {
-            if scan_pages_rendered < MAX_SCAN_OCR_PAGES {
-                scan_pages_rendered += 1;
-                // Render scanned or vector-glyph-only page to BGRA bitmap -> RGBA PNG for OCR pipeline
-                let pw = unsafe { f_page_w(page) };
-                let ph = unsafe { f_page_h(page) };
-                let scale = 1.5f64;
-                let bw = (pw * scale).round().clamp(64.0, 1600.0) as c_int;
-                let bh = (ph * scale).round().clamp(64.0, 2200.0) as c_int;
-                let bmp = unsafe { f_bmp_create(bw, bh, 0) };
-                if !bmp.is_null() {
-                    unsafe {
-                        f_bmp_fill(bmp, 0, 0, bw, bh, 0xFFFF_FFFF);
-                        f_bmp_render(bmp, page, 0, 0, bw, bh, 0, 0);
-                        let ptr = f_bmp_buf(bmp);
-                        let stride = f_bmp_stride(bmp) as usize;
-                        if !ptr.is_null() && stride >= (bw as usize) * 4 {
-                            let raw = std::slice::from_raw_parts(ptr, stride * (bh as usize));
-                            let mut rgba = Vec::with_capacity((bw as usize) * (bh as usize) * 4);
-                            for y in 0..(bh as usize) {
-                                let row = &raw[y * stride..y * stride + (bw as usize) * 4];
-                                for bgra in row.chunks_exact(4) {
-                                    rgba.extend_from_slice(&[bgra[2], bgra[1], bgra[0], bgra[3]]);
-                                }
-                            }
-                            if let Some(im) = image::RgbaImage::from_raw(bw as u32, bh as u32, rgba) {
-                                let mut png_buf = Cursor::new(Vec::new());
-                                if image::DynamicImage::ImageRgba8(im)
-                                    .write_to(&mut png_buf, image::ImageFormat::Png)
-                                    .is_ok()
-                                {
-                                    embedded_images.push((format!("pdf_scan_page_{}.png", i + 1), png_buf.into_inner()));
-                                }
-                            }
-                        }
-                        f_bmp_destroy(bmp);
-                    }
+            if render_scan_pages {
+                if let Some(png) = render_pdfium_page_png(api, page) {
+                    embedded_images.push((format!("pdf_scan_page_{}.png", i + 1), png));
                 }
             } else {
-                skipped_scan_pages += 1;
+                deferred_scan_pages.push(i);
             }
         }
         unsafe { f_close_page(page) };
@@ -675,12 +890,6 @@ fn extract_pdf_with_pdfium(
         }
     }
 
-    if skipped_scan_pages > 0 {
-        warnings.push(format!(
-            "PDF 共 {page_count} 页，已渲染前 {MAX_SCAN_OCR_PAGES} 页扫描页执行 OCR，其余 {skipped_scan_pages} 页空白/扫描页已跳过"
-        ));
-    }
-
     if let Some(ht) = build_head_tail_segment(&all_text) {
         let insert_idx = usize::from(!meta_lines.is_empty());
         segments.insert(insert_idx, ht);
@@ -693,6 +902,7 @@ fn extract_pdf_with_pdfium(
     Ok(PdfParseOutcome {
         segments,
         embedded_images,
+        deferred_scan_pages,
         encrypted_locked: false,
         warnings,
     })
@@ -764,6 +974,7 @@ fn extract_pdf_fallback_streams(bytes: &[u8]) -> PdfParseOutcome {
     PdfParseOutcome {
         segments,
         embedded_images: Vec::new(),
+        deferred_scan_pages: Vec::new(),
         encrypted_locked: false,
         warnings: Vec::new(),
     }

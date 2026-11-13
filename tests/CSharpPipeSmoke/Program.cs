@@ -150,7 +150,37 @@ try
 
     Console.WriteLine($"[C# IPC] Search & Preview OK: doc_id={preview.DocId}, segments={preview.Segments.Count}");
 
-    // 4. Shutdown
+    // 4. Verify DaemonPipeClient (exact WPF async client used by App.UI)
+    await using (var ipcClient = new DaemonPipeClient())
+    {
+        if (!await ipcClient.TryConnectOnceAsync(pipeName, 5000, CancellationToken.None))
+            throw new Exception("DaemonPipeClient.TryConnectOnceAsync failed");
+        var ipcPong = await ipcClient.SendAsync(new JsonObject { ["type"] = "Ping" });
+        if (ipcPong["type"]?.AsStr() != "Pong")
+            throw new Exception($"DaemonPipeClient Ping failed: {ipcPong}");
+        var ipcStats = await ipcClient.SendAsync(new JsonObject { ["type"] = "GetStats" });
+        if (ipcStats["stats"] is null)
+            throw new Exception("DaemonPipeClient GetStats returned null");
+        var ipcSearch = await ipcClient.SendAsync(new JsonObject
+        {
+            ["type"] = "Search",
+            ["query"] = new JsonObject
+            {
+                ["text"] = "3200",
+                ["file_ext_filter"] = null,
+                ["scope_filter"] = null,
+                ["use_regex"] = false,
+                ["limit"] = 10,
+                ["offset"] = 0
+            }
+        });
+        var ipcItems = ipcSearch["items"]!.Deserialize<List<SearchHitItemDto>>()!;
+        if (ipcItems.Count != 1 || ipcItems[0].ModifiedUnixMs <= 0 || ipcItems[0].ByteSize == 0)
+            throw new Exception($"DaemonPipeClient Search failed metadata check: count={ipcItems.Count}");
+        Console.WriteLine($"[C# IPC] DaemonPipeClient verified OK: mtimeMs={ipcItems[0].ModifiedUnixMs}, size={ipcItems[0].ByteSize}");
+    }
+
+    // 5. Shutdown
     await MsgPackCodec.WriteFrameAsync(pipe, new JsonObject
     {
         ["req_id"] = 5,

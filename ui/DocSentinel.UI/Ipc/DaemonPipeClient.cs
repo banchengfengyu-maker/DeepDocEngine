@@ -9,7 +9,7 @@ namespace DocSentinel.UI.Ipc;
 
 public sealed class DaemonPipeClient : IAsyncDisposable
 {
-    private const string PipeName = "DeepDocEngine.v1";
+    public const string DefaultPipeName = "DeepDocEngine.v1";
     private NamedPipeClientStream? _pipe;
     private CancellationTokenSource? _cts;
     private Task? _readLoop;
@@ -18,6 +18,7 @@ public sealed class DaemonPipeClient : IAsyncDisposable
     private readonly ConcurrentDictionary<ulong, TaskCompletionSource<JsonObject>> _pending = new();
 
     public event Action<JsonObject>? OnScanProgress;
+    public event Action<JsonObject>? OnScanFastPassCompleted;
     public event Action<HitRecordDto>? OnScanHit;
     public event Action<ScanSummaryDto>? OnScanCompleted;
     public event Action<JsonObject>? OnDeepDeleteProgress;
@@ -26,10 +27,21 @@ public sealed class DaemonPipeClient : IAsyncDisposable
 
     public bool IsConnected => _pipe is { IsConnected: true };
 
-    public async Task ConnectOrStartDaemonAsync(CancellationToken ct = default)
+    public async Task ConnectOrStartDaemonAsync(string pipeName = DefaultPipeName, string? dataDir = null, bool forceReconnect = false, CancellationToken ct = default)
     {
-        if (await TryConnectOnceAsync(1500, ct))
+        if (!forceReconnect && IsConnected)
             return;
+
+        if (forceReconnect)
+            await ResetConnectionAsync();
+
+        bool isDefaultPipe = string.Equals(pipeName, DefaultPipeName, StringComparison.OrdinalIgnoreCase);
+        bool alreadyRunning = isDefaultPipe && Process.GetProcessesByName("engine-daemon").Length > 0;
+        var connStatus = await TryConnectWithStatusAsync(pipeName, alreadyRunning ? 1500 : 120, ct);
+        if (connStatus == PipeTryConnectResult.Connected)
+            return;
+        if (connStatus == PipeTryConnectResult.AccessDenied)
+            throw new UnauthorizedAccessException("检测到后台 engine-daemon 正在以管理员权限运行，当前普通权限窗口无权连接（请退出旧管理员进程或升级重启后再试）。");
 
         // Auto-spawn sibling engine-daemon.exe if available
         string baseDir = AppContext.BaseDirectory;
@@ -48,28 +60,73 @@ public sealed class DaemonPipeClient : IAsyncDisposable
                 UseShellExecute = false,
                 CreateNoWindow = true,
             };
+            if (!isDefaultPipe)
+            {
+                psi.ArgumentList.Add("--pipe");
+                psi.ArgumentList.Add($@"\\.\pipe\{pipeName}");
+            }
+            if (!string.IsNullOrWhiteSpace(dataDir))
+            {
+                psi.ArgumentList.Add("--data-dir");
+                psi.ArgumentList.Add(dataDir);
+            }
             Process.Start(psi);
         }
 
-        if (!await TryConnectOnceAsync(6000, ct))
-            throw new TimeoutException("无法连接到后台引擎命名管道 `\\\\.\\pipe\\DeepDocEngine.v1`。请先启动 engine-daemon.exe。");
+        var spawnConn = await TryConnectWithStatusAsync(pipeName, 8000, ct);
+        if (spawnConn == PipeTryConnectResult.AccessDenied)
+            throw new UnauthorizedAccessException("后台 engine-daemon 管道访问被系统 UAC 拒绝（可能已存在高权限旧实例）。");
+        if (spawnConn != PipeTryConnectResult.Connected)
+            throw new TimeoutException($"无法连接到本机后台引擎管道 `\\\\.\\pipe\\{pipeName}`。请确认 engine-daemon.exe 可正常启动。");
     }
 
-    private async Task<bool> TryConnectOnceAsync(int timeoutMs, CancellationToken ct)
+    private enum PipeTryConnectResult { Connected, Unavailable, AccessDenied }
+
+    public async Task<bool> TryConnectOnceAsync(string pipeName, int timeoutMs, CancellationToken ct) =>
+        await TryConnectWithStatusAsync(pipeName, timeoutMs, ct) == PipeTryConnectResult.Connected;
+
+    private async Task<PipeTryConnectResult> TryConnectWithStatusAsync(string pipeName, int timeoutMs, CancellationToken ct)
     {
-        var client = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+        var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
         try
         {
             await client.ConnectAsync(timeoutMs, ct);
+            await ResetConnectionAsync();
             _pipe = client;
             _cts = new CancellationTokenSource();
             _readLoop = Task.Run(() => ReadLoopAsync(_cts.Token));
-            return true;
+            return PipeTryConnectResult.Connected;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            await client.DisposeAsync();
+            return PipeTryConnectResult.AccessDenied;
         }
         catch
         {
             await client.DisposeAsync();
-            return false;
+            return PipeTryConnectResult.Unavailable;
+        }
+    }
+
+    private async Task ResetConnectionAsync()
+    {
+        var cts = Interlocked.Exchange(ref _cts, null);
+        if (cts is not null)
+        {
+            await cts.CancelAsync();
+            cts.Dispose();
+        }
+        var pipe = Interlocked.Exchange(ref _pipe, null);
+        if (pipe is not null)
+            await pipe.DisposeAsync();
+        var readLoop = Interlocked.Exchange(ref _readLoop, null);
+        if (readLoop is not null)
+            try { await readLoop; } catch { }
+        foreach (var kv in _pending)
+        {
+            if (_pending.TryRemove(kv.Key, out var tcs))
+                tcs.TrySetCanceled();
         }
     }
 
@@ -83,10 +140,15 @@ public sealed class DaemonPipeClient : IAsyncDisposable
                 if (node is null) break;
                 if (node is not JsonObject obj) continue;
 
-                string? type = obj["type"]?.GetValue<string>();
+                string? type = obj["type"]?.AsStr();
                 if (type == "ScanProgress")
                 {
                     OnScanProgress?.Invoke(obj);
+                    continue;
+                }
+                if (type == "ScanFastPassCompleted")
+                {
+                    OnScanFastPassCompleted?.Invoke(obj);
                     continue;
                 }
                 if (type == "ScanHit")
@@ -112,9 +174,10 @@ public sealed class DaemonPipeClient : IAsyncDisposable
                     continue;
                 }
 
-                if (obj["req_id"] is JsonValue reqVal && reqVal.TryGetValue<ulong>(out var reqId))
+                if (obj["req_id"] is not null)
                 {
-                    if (_pending.TryRemove(reqId, out var tcs))
+                    ulong reqId = obj["req_id"].AsUInt64(ulong.MaxValue);
+                    if (reqId != ulong.MaxValue && _pending.TryRemove(reqId, out var tcs))
                         tcs.TrySetResult(obj);
                 }
             }
@@ -160,24 +223,16 @@ public sealed class DaemonPipeClient : IAsyncDisposable
 
         using var reg = ct.Register(() => tcs.TrySetCanceled(ct));
         var resp = await tcs.Task;
-        if (resp["type"]?.GetValue<string>() == "Error")
+        if (resp["type"]?.AsStr() == "Error")
         {
-            throw new InvalidOperationException($"{resp["code"]}: {resp["message"]}");
+            throw new InvalidOperationException($"{resp["code"]?.AsStr()}: {resp["message"]?.AsStr()}");
         }
         return resp;
     }
 
     public async ValueTask DisposeAsync()
     {
-        if (_cts is not null)
-        {
-            await _cts.CancelAsync();
-            _cts.Dispose();
-        }
-        if (_pipe is not null)
-            await _pipe.DisposeAsync();
-        if (_readLoop is not null)
-            try { await _readLoop; } catch { }
+        await ResetConnectionAsync();
         _writeLock.Dispose();
     }
 }

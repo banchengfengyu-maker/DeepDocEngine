@@ -331,6 +331,8 @@ impl CompiledRuleSet {
                     file_name: doc.file_name.clone(),
                     detected_format: doc.detected_format.clone(),
                     blake3_hex: doc.blake3_hex.clone(),
+                    byte_size: doc.byte_size,
+                    modified_unix_ms: 0,
                     rule_id: rule.def.id.clone(),
                     rule_name: rule.def.name.clone(),
                     severity: rule.def.severity.clone(),

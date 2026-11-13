@@ -3,10 +3,13 @@ use deepdoc_protocol::{FailureKind, WorkerCapabilities, WorkerRequest, WorkerRes
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+
+const MAX_TASKS_PER_WORKER: usize = 2500;
 
 #[cfg(windows)]
 struct JobObjectGuard(windows_sys::Win32::Foundation::HANDLE);
@@ -55,10 +58,15 @@ struct WorkerProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
+    tasks_handled: usize,
 }
 
 impl WorkerProcess {
-    async fn spawn(exe: &PathBuf, job: Option<&Arc<JobObjectGuard>>) -> Result<Self, String> {
+    async fn spawn(
+        exe: &PathBuf,
+        job: Option<&Arc<JobObjectGuard>>,
+        low_resource: bool,
+    ) -> Result<Self, String> {
         let mut cmd = Command::new(exe);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -67,8 +75,9 @@ impl WorkerProcess {
         #[cfg(windows)]
         {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
-            cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+            const IDLE_PRIORITY_CLASS: u32 = 0x0000_0040;
+            let prio = if low_resource { IDLE_PRIORITY_CLASS } else { 0 };
+            cmd.creation_flags(CREATE_NO_WINDOW | prio);
         }
         let mut child = cmd
             .spawn()
@@ -94,6 +103,7 @@ impl WorkerProcess {
             child,
             stdin,
             stdout,
+            tasks_handled: 0,
         })
     }
 
@@ -120,19 +130,15 @@ impl WorkerProcess {
     }
 }
 
-struct PoolState {
-    idle: VecDeque<WorkerProcess>,
-    live_count: usize,
-}
-
 pub struct WorkerPool {
     exe_path: PathBuf,
     #[cfg(windows)]
     job: Option<Arc<JobObjectGuard>>,
-    state: Mutex<PoolState>,
-    notify: Notify,
+    idle: Mutex<VecDeque<WorkerProcess>>,
+    slots: Arc<Semaphore>,
     max_size: usize,
     ocr_warmup: Mutex<Arc<Vec<(String, String)>>>,
+    low_resource: AtomicBool,
 }
 
 impl WorkerPool {
@@ -143,37 +149,31 @@ impl WorkerPool {
         #[cfg(windows)]
         let job = create_sandbox_job().map(Arc::new);
 
+        let mut deque = VecDeque::with_capacity(max_size);
         if !exe_path.exists() {
             // Verify spawnability cleanly on Windows PATH fallback if relative name was passed
-            let test_wp = WorkerProcess::spawn(&exe_path, job.as_ref()).await?;
-            let mut deque = VecDeque::with_capacity(max_size);
+            let test_wp = WorkerProcess::spawn(&exe_path, job.as_ref(), false).await?;
             deque.push_back(test_wp);
-            return Ok(Arc::new(Self {
-                exe_path,
-                #[cfg(windows)]
-                job,
-                state: Mutex::new(PoolState {
-                    idle: deque,
-                    live_count: 1,
-                }),
-                notify: Notify::new(),
-                max_size,
-                ocr_warmup: Mutex::new(Arc::new(Vec::new())),
-            }));
         }
 
         Ok(Arc::new(Self {
             exe_path,
             #[cfg(windows)]
             job,
-            state: Mutex::new(PoolState {
-                idle: VecDeque::with_capacity(max_size),
-                live_count: 0,
-            }),
-            notify: Notify::new(),
+            idle: Mutex::new(deque),
+            slots: Arc::new(Semaphore::new(max_size)),
             max_size,
             ocr_warmup: Mutex::new(Arc::new(Vec::new())),
+            low_resource: AtomicBool::new(false),
         }))
+    }
+
+    /// Toggle idle-priority (`IDLE_PRIORITY_CLASS`) worker scheduling for low CPU/RAM footprint indexing.
+    pub async fn set_low_resource(&self, enabled: bool) {
+        let prev = self.low_resource.swap(enabled, Ordering::Relaxed);
+        if prev != enabled || enabled {
+            self.shrink_idle(0).await;
+        }
     }
 
     /// Update persistent OCR cache warmup entries for newly spawned (and currently idle) workers.
@@ -183,121 +183,110 @@ impl WorkerPool {
             return;
         }
         let existing_idle = {
-            let mut st = self.state.lock().await;
-            st.idle.drain(..).collect::<Vec<_>>()
+            let mut idle = self.idle.lock().await;
+            idle.drain(..).collect::<Vec<_>>()
         };
         let req = WorkerRequest::WarmOcrCache {
             entries: (*entries).clone(),
         };
         for mut wp in existing_idle {
             if wp.call(&req, Duration::from_secs(5)).await.is_ok() {
-                self.release(wp).await;
+                let mut idle = self.idle.lock().await;
+                if idle.len() < self.max_size {
+                    idle.push_back(wp);
+                } else {
+                    drop(idle);
+                    let _ = wp.child.kill().await;
+                }
             } else {
-                self.retire_broken(wp).await;
+                let _ = wp.child.kill().await;
             }
         }
     }
 
     /// Release idle worker processes down to `keep` so resident OCR/PDFium RAM is freed when idle.
     pub async fn shrink_idle(&self, keep: usize) {
-        let mut to_kill = Vec::new();
-        {
-            let mut st = self.state.lock().await;
-            while st.idle.len() > keep {
-                if let Some(wp) = st.idle.pop_back() {
-                    st.live_count = st.live_count.saturating_sub(1);
-                    to_kill.push(wp);
+        let to_kill = {
+            let mut idle = self.idle.lock().await;
+            let mut drained = Vec::new();
+            while idle.len() > keep {
+                if let Some(wp) = idle.pop_back() {
+                    drained.push(wp);
                 }
             }
-        }
+            drained
+        };
         for mut wp in to_kill {
             let _ = wp.child.kill().await;
         }
-        self.notify.notify_waiters();
     }
 
-    async fn acquire(&self) -> Result<WorkerProcess, String> {
-        loop {
-            let should_spawn = {
-                let mut st = self.state.lock().await;
-                if let Some(wp) = st.idle.pop_front() {
-                    return Ok(wp);
-                }
-                if st.live_count < self.max_size {
-                    st.live_count += 1;
-                    true
-                } else {
-                    false
-                }
-            };
+    async fn acquire(&self) -> Result<(OwnedSemaphorePermit, WorkerProcess), String> {
+        let permit = self
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "worker pool closed".to_string())?;
 
-            if should_spawn {
-                match WorkerProcess::spawn(&self.exe_path, self.job.as_ref()).await {
-                    Ok(mut wp) => {
-                        let warmup = self.ocr_warmup.lock().await.clone();
-                        if !warmup.is_empty() {
-                            let req = WorkerRequest::WarmOcrCache {
-                                entries: (*warmup).clone(),
-                            };
-                            let _ = wp.call(&req, Duration::from_secs(5)).await;
-                        }
-                        return Ok(wp);
-                    }
-                    Err(e) => {
-                        let mut st = self.state.lock().await;
-                        st.live_count = st.live_count.saturating_sub(1);
-                        drop(st);
-                        self.notify.notify_one();
-                        return Err(e);
-                    }
-                }
-            }
-            self.notify.notified().await;
+        if let Some(wp) = self.idle.lock().await.pop_front() {
+            return Ok((permit, wp));
         }
+
+        let low_res = self.low_resource.load(Ordering::Relaxed);
+        let mut wp = WorkerProcess::spawn(&self.exe_path, self.job.as_ref(), low_res).await?;
+        let warmup = self.ocr_warmup.lock().await.clone();
+        if !warmup.is_empty() {
+            let req = WorkerRequest::WarmOcrCache {
+                entries: (*warmup).clone(),
+            };
+            let _ = wp.call(&req, Duration::from_secs(5)).await;
+        }
+        Ok((permit, wp))
     }
 
-    async fn release(&self, wp: WorkerProcess) {
-        let excess = {
-            let mut st = self.state.lock().await;
-            if st.idle.len() < self.max_size {
-                st.idle.push_back(wp);
+    async fn release(&self, permit: OwnedSemaphorePermit, mut wp: WorkerProcess, count_task: bool) {
+        if count_task {
+            wp.tasks_handled += 1;
+        }
+        let excess = if wp.tasks_handled >= MAX_TASKS_PER_WORKER {
+            Some(wp)
+        } else {
+            let mut idle = self.idle.lock().await;
+            if idle.len() < self.max_size {
+                idle.push_back(wp);
                 None
             } else {
-                st.live_count = st.live_count.saturating_sub(1);
                 Some(wp)
             }
         };
-        if let Some(mut extra) = excess {
-            let _ = extra.child.kill().await;
+        if let Some(mut old) = excess {
+            let _ = old.child.kill().await;
         }
-        self.notify.notify_one();
+        drop(permit);
     }
 
-    async fn retire_broken(&self, mut wp: WorkerProcess) {
+    async fn retire_broken(&self, permit: OwnedSemaphorePermit, mut wp: WorkerProcess) {
         let _ = wp.child.kill().await;
-        {
-            let mut st = self.state.lock().await;
-            st.live_count = st.live_count.saturating_sub(1);
-        }
-        self.notify.notify_one();
+        drop(permit);
     }
 
     pub async fn health_check(&self) -> Result<WorkerCapabilities, String> {
-        let mut wp = self.acquire().await?;
+        let (permit, mut wp) = self.acquire().await?;
         let res = wp
             .call(&WorkerRequest::HealthCheck, Duration::from_secs(5))
             .await;
         match res {
             Ok(WorkerResponse::Health { capabilities }) => {
-                self.release(wp).await;
+                self.release(permit, wp, false).await;
                 Ok(capabilities)
             }
             Ok(_) => {
-                self.release(wp).await;
+                self.release(permit, wp, false).await;
                 Err("unexpected health response".into())
             }
             Err(e) => {
-                self.retire_broken(wp).await;
+                self.retire_broken(permit, wp).await;
                 Err(e)
             }
         }
@@ -319,11 +308,16 @@ impl WorkerPool {
                 virtual_path,
                 ..
             } => (*task_id, virtual_path.clone()),
+            WorkerRequest::OcrImageBytes { task_id, label, .. } => (*task_id, label.clone()),
+            WorkerRequest::OcrPdfPages {
+                task_id, disk_path, ..
+            } => (*task_id, disk_path.clone()),
+            WorkerRequest::ParseFilesBatch { task_id, .. } => (*task_id, "batch".into()),
             WorkerRequest::HealthCheck | WorkerRequest::WarmOcrCache { .. } => (0, String::new()),
         };
 
-        let mut wp = match self.acquire().await {
-            Ok(w) => w,
+        let (permit, mut wp) = match self.acquire().await {
+            Ok(pair) => pair,
             Err(e) => {
                 return WorkerResponse::Failed {
                     task_id,
@@ -336,7 +330,7 @@ impl WorkerPool {
 
         match wp.call(&req, timeout).await {
             Ok(resp) => {
-                self.release(wp).await;
+                self.release(permit, wp, true).await;
                 resp
             }
             Err(err) => {
@@ -345,7 +339,7 @@ impl WorkerPool {
                 } else {
                     FailureKind::InternalError
                 };
-                self.retire_broken(wp).await;
+                self.retire_broken(permit, wp).await;
                 WorkerResponse::Failed {
                     task_id,
                     virtual_path,

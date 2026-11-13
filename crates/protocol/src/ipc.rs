@@ -21,6 +21,8 @@ pub struct ScanOptions {
     pub min_byte_size: Option<u64>,
     #[serde(default)]
     pub max_byte_size: Option<u64>,
+    #[serde(default)]
+    pub low_resource_mode: bool,
 }
 
 impl Default for ScanOptions {
@@ -29,7 +31,7 @@ impl Default for ScanOptions {
             include_hidden: false,
             use_usn_if_available: true,
             worker_count: std::thread::available_parallelism()
-                .map(|n| n.get().clamp(2, 6))
+                .map(|n| n.get().clamp(2, 8))
                 .unwrap_or(4),
             worker_timeout_ms: 45_000,
             parse: ParseOptions::default(),
@@ -38,6 +40,7 @@ impl Default for ScanOptions {
             include_extensions: Vec::new(),
             min_byte_size: None,
             max_byte_size: None,
+            low_resource_mode: false,
         }
     }
 }
@@ -49,14 +52,19 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchQuery {
     pub text: String,
+    #[serde(default)]
     pub file_ext_filter: Option<String>,
     #[serde(default)]
     pub path_prefix: Option<String>,
+    #[serde(default)]
     pub scope_filter: Option<SegmentScope>,
+    #[serde(default)]
     pub use_regex: bool,
     #[serde(default = "default_true")]
     pub match_all_terms: bool,
+    #[serde(default)]
     pub limit: usize,
+    #[serde(default)]
     pub offset: usize,
 }
 
@@ -99,6 +107,10 @@ pub enum ClientRequest {
         use_regex: bool,
         file_ext_filter: Option<String>,
         options: ScanOptions,
+        #[serde(default = "default_true")]
+        match_all_terms: bool,
+        #[serde(default)]
+        cancel_active_jobs: bool,
     },
     CancelScan {
         job_id: String,
@@ -123,10 +135,12 @@ pub enum ClientRequest {
     ClearIndex,
     /// Rebuild/reset document & Tantivy index while keeping persistent `ocr_image_cache`.
     ResetIndexKeepOcr,
-    /// Gentle, AV-friendly multi-pass secure file erasure + index purge.
+    /// Gentle, AV-friendly multi-pass secure file/folder erasure + index purge.
     DeepDeleteFiles {
         job_id: String,
         paths: Vec<String>,
+        #[serde(default)]
+        cancel_active_jobs: bool,
     },
     Shutdown,
 }
@@ -148,6 +162,10 @@ pub struct HitRecord {
     pub file_name: String,
     pub detected_format: String,
     pub blake3_hex: String,
+    #[serde(default)]
+    pub byte_size: u64,
+    #[serde(default)]
+    pub modified_unix_ms: i64,
     pub rule_id: String,
     pub rule_name: String,
     pub severity: String,
@@ -164,6 +182,8 @@ pub struct SearchHitItem {
     pub detected_format: String,
     pub blake3_hex: String,
     pub byte_size: u64,
+    #[serde(default)]
+    pub modified_unix_ms: i64,
     pub snippets: Vec<HitLocationSnippet>,
 }
 
@@ -224,6 +244,8 @@ pub enum DaemonMessage {
         worker_engines: Vec<String>,
         ext_worker_engines: Vec<String>,
         indexed_docs: u64,
+        #[serde(default)]
+        active_jobs: usize,
     },
     Ack {
         req_id: u64,
@@ -238,6 +260,19 @@ pub enum DaemonMessage {
         encrypted_files: u64,
         failed_files: u64,
         current_path: String,
+        elapsed_ms: u64,
+        #[serde(default)]
+        phase: String,
+        #[serde(default)]
+        ocr_pending: u64,
+        #[serde(default)]
+        ocr_done: u64,
+    },
+    ScanFastPassCompleted {
+        job_id: String,
+        fast_parsed_ok: u64,
+        skipped_cached: u64,
+        deferred_ocr_count: u64,
         elapsed_ms: u64,
     },
     ScanHit {

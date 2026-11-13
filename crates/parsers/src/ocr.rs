@@ -1,7 +1,8 @@
 use crate::adapters::find_native_asset;
 use deepdoc_protocol::{SegmentScope, TextSegment};
 use deepdoc_source_fs::blake3_bytes;
-use image::{imageops::FilterType, DynamicImage};
+use image::imageops::FilterType;
+use image::DynamicImage;
 use ort::{
     environment::Environment,
     session::Session,
@@ -11,6 +12,13 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+
+#[derive(Debug, Clone)]
+pub enum ImageStageCheck {
+    Skip,
+    Cached(Option<TextSegment>),
+    NeedsOcr(String),
+}
 
 #[derive(Debug, Clone)]
 pub struct ImageFilterOutcome {
@@ -182,10 +190,43 @@ impl OcrPipeline {
             }
         }
 
-        if let Some(seg) = self.process_single_frame(label, bytes, min_dim, warnings) {
-            out.push(seg);
-        }
+        out.extend(self.process_single_frame(label, bytes, min_dim, warnings));
         out
+    }
+
+    /// Lightweight Stage-1 check: rejects tiny UI icons / strips / pixel bombs without full RGB decode,
+    /// and reuses persistent `ocr_image_cache` if already recognized.
+    pub fn check_stage1_image(&self, label: &str, bytes: &[u8], min_dim: u32) -> ImageStageCheck {
+        const MAX_IMAGE_PIXELS: u64 = 120_000_000;
+        if let Ok(reader) = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format() {
+            if let Ok((w, h)) = reader.into_dimensions() {
+                if w < min_dim || h < min_dim {
+                    return ImageStageCheck::Skip;
+                }
+                let min_s = w.min(h).max(1);
+                let max_s = w.max(h);
+                if min_s < 40 && (max_s / min_s) > 40 {
+                    return ImageStageCheck::Skip;
+                }
+                if (w as u64).saturating_mul(h as u64) > MAX_IMAGE_PIXELS {
+                    return ImageStageCheck::Skip;
+                }
+            }
+        }
+        let img_blake3 = blake3_bytes(bytes);
+        if let Ok(guard) = self.cache.lock() {
+            if let Some(cached) = guard.get(&img_blake3) {
+                if cached.is_empty() {
+                    return ImageStageCheck::Cached(None);
+                }
+                return ImageStageCheck::Cached(Some(TextSegment {
+                    scope: SegmentScope::Ocr,
+                    location_label: format!("{label} (OCR缓存复用)"),
+                    text: cached.clone(),
+                }));
+            }
+        }
+        ImageStageCheck::NeedsOcr(img_blake3)
     }
 
     fn process_single_frame(
@@ -194,9 +235,128 @@ impl OcrPipeline {
         bytes: &[u8],
         min_dim: u32,
         warnings: &mut Vec<String>,
-    ) -> Option<TextSegment> {
-        let img = image::load_from_memory(bytes).ok()?;
-        self.process_dynamic_image(label, &img, &blake3_bytes(bytes), min_dim, warnings)
+    ) -> Vec<TextSegment> {
+        // Inspect header dimensions BEFORE allocating huge RGBA/RGB pixel buffers to prevent decompression OOMs on large images.
+        const MAX_IMAGE_PIXELS: u64 = 120_000_000;
+        if let Ok(reader) = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format() {
+            if let Ok((w, h)) = reader.into_dimensions() {
+                if w < min_dim || h < min_dim {
+                    return Vec::new();
+                }
+                let min_s = w.min(h).max(1);
+                let max_s = w.max(h);
+                if min_s < 40 && (max_s / min_s) > 40 {
+                    return Vec::new();
+                }
+                if (w as u64).saturating_mul(h as u64) > MAX_IMAGE_PIXELS {
+                    warnings.push(format!(
+                        "图像 `{label}` 分辨率超过安全上限 ({w}x{h} > 1.2亿像素)，已跳过解码防内存溢出"
+                    ));
+                    return Vec::new();
+                }
+            }
+        }
+        let Some(img) = image::load_from_memory(bytes).ok() else {
+            return Vec::new();
+        };
+        let whole_hash = blake3_bytes(bytes);
+        self.process_image_native_or_tiled(label, &img, &whole_hash, min_dim, warnings)
+    }
+
+    fn process_image_native_or_tiled(
+        &self,
+        label: &str,
+        img: &DynamicImage,
+        img_blake3: &str,
+        min_dim: u32,
+        warnings: &mut Vec<String>,
+    ) -> Vec<TextSegment> {
+        const TILE_THRESHOLD: u32 = 2560;
+        const TILE_SIZE: u32 = 2048;
+        const TILE_OVERLAP: u32 = 192;
+
+        if img.width() <= TILE_THRESHOLD && img.height() <= TILE_THRESHOLD {
+            return self
+                .process_dynamic_image(label, img, img_blake3, min_dim, warnings)
+                .into_iter()
+                .collect();
+        }
+
+        if let Ok(guard) = self.cache.lock() {
+            if let Some(cached) = guard.get(img_blake3) {
+                if cached.is_empty() {
+                    return Vec::new();
+                }
+                return vec![TextSegment {
+                    scope: SegmentScope::Ocr,
+                    location_label: format!("{label} (大图切分OCR缓存复用)"),
+                    text: cached.clone(),
+                }];
+            }
+        }
+
+        if !self.is_ready() {
+            return Vec::new();
+        }
+
+        // Preserve full 1:1 native sharpness on large terrain/CAD maps by overlapping tiles instead of shrinking.
+        let tiles = compute_ocr_tiles(img.width(), img.height(), TILE_SIZE, TILE_OVERLAP);
+        let mut seen_lines = std::collections::HashSet::new();
+        let mut collected_blocks = Vec::new();
+
+        for (row, col, x, y, tw, th) in tiles {
+            if tw < min_dim || th < min_dim {
+                continue;
+            }
+            let tile = img.crop_imm(x, y, tw, th);
+            if is_solid_color_block(&tile) {
+                continue;
+            }
+            let raw = self.recognize_image(&tile, warnings);
+            let mut tile_lines = Vec::new();
+            for line in raw.lines() {
+                let clean = line.trim();
+                if !clean.is_empty() && seen_lines.insert(clean.to_string()) {
+                    tile_lines.push(clean.to_string());
+                }
+            }
+            if !tile_lines.is_empty() {
+                collected_blocks.push(format!(
+                    "[分块 R{}C{}] {}",
+                    row + 1,
+                    col + 1,
+                    tile_lines.join("\n")
+                ));
+            }
+        }
+
+        let merged = collected_blocks.join("\n");
+        if let Ok(mut guard) = self.cache.lock() {
+            if guard.len() >= 16384 {
+                guard.clear();
+            }
+            guard.insert(img_blake3.to_string(), merged.clone());
+        }
+        if let Ok(mut pend) = self.pending_new_cache.lock() {
+            if pend.len() < 512 {
+                pend.push((
+                    img_blake3.to_string(),
+                    img.width(),
+                    img.height(),
+                    merged.clone(),
+                ));
+            }
+        }
+
+        if merged.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![TextSegment {
+                scope: SegmentScope::Ocr,
+                location_label: format!("{label} ({}x{} 大图分块OCR)", img.width(), img.height()),
+                text: merged,
+            }]
+        }
     }
 
     fn process_dynamic_image(
@@ -303,7 +463,14 @@ impl OcrPipeline {
         }
 
         match &mut *guard {
-            OnnxEngineState::Ready(engine) => engine.recognize(img),
+            OnnxEngineState::Ready(engine) => {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    engine.recognize(img)
+                })) {
+                    Ok(res) => res,
+                    Err(_) => Err("onnx ocr runtime panicked (safely isolated)".into()),
+                }
+            }
             OnnxEngineState::Failed(e) => Err(e.clone()),
             OnnxEngineState::Uninitialized => unreachable!(),
         }
@@ -1149,4 +1316,63 @@ mod tests {
         assert_eq!(decode_ctc_greedy(&dict, &logits, 3, 4), "测试");
         let _ = should_use_directml_gpu();
     }
+
+    #[test]
+    fn computes_overlapping_tiles_covering_edges() {
+        let tiles = compute_ocr_tiles(5000, 4200, 2048, 192);
+        assert!(tiles.len() >= 6);
+        let max_x_end = tiles.iter().map(|t| t.2 + t.4).max().unwrap();
+        let max_y_end = tiles.iter().map(|t| t.3 + t.5).max().unwrap();
+        assert_eq!(max_x_end, 5000);
+        assert_eq!(max_y_end, 4200);
+        assert!(tiles.iter().all(|t| t.4 <= 2048 && t.5 <= 2048));
+    }
+}
+
+fn compute_ocr_tiles(
+    width: u32,
+    height: u32,
+    tile_size: u32,
+    overlap: u32,
+) -> Vec<(usize, usize, u32, u32, u32, u32)> {
+    let step = tile_size.saturating_sub(overlap).max(256);
+    let mut xs = Vec::new();
+    let mut x = 0u32;
+    loop {
+        let rem = width.saturating_sub(x);
+        if rem <= tile_size {
+            let start = width.saturating_sub(tile_size).min(x);
+            if xs.last().copied() != Some(start) {
+                xs.push(start);
+            }
+            break;
+        }
+        xs.push(x);
+        x = x.saturating_add(step);
+    }
+
+    let mut ys = Vec::new();
+    let mut y = 0u32;
+    loop {
+        let rem = height.saturating_sub(y);
+        if rem <= tile_size {
+            let start = height.saturating_sub(tile_size).min(y);
+            if ys.last().copied() != Some(start) {
+                ys.push(start);
+            }
+            break;
+        }
+        ys.push(y);
+        y = y.saturating_add(step);
+    }
+
+    let mut out = Vec::with_capacity(xs.len() * ys.len());
+    for (row, &ty) in ys.iter().enumerate() {
+        let th = height.saturating_sub(ty).min(tile_size);
+        for (col, &tx) in xs.iter().enumerate() {
+            let tw = width.saturating_sub(tx).min(tile_size);
+            out.push((row, col, tx, ty, tw, th));
+        }
+    }
+    out
 }

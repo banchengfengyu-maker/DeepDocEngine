@@ -14,6 +14,8 @@ AppName=DeepDocEngine
 AppVerName=DeepDocEngine v{#AppVersion}
 AppVersion={#AppVersion}
 AppPublisher=DeepDocEngine
+SetupIconFile=..\ui\DocSentinel.UI\Assets\app.ico
+UninstallDisplayIcon={app}\App.UI.exe
 DefaultDirName={autopf}\DeepDocEngine
 DefaultGroupName=DeepDocEngine
 AllowNoIcons=yes
@@ -52,6 +54,29 @@ Name: "{autodesktop}\DeepDocEngine"; Filename: "{app}\App.UI.exe"; WorkingDir: "
 
 [Run]
 Filename: "{app}\App.UI.exe"; Description: "{cm:LaunchApp}"; Flags: nowait postinstall skipifsilent
+
+[Registry]
+; Windows 资源管理器文件与文件夹右键菜单：深度查密 / 深度擦除（安装到当前用户 HKCU，卸载自动清理）
+Root: HKCU; Subkey: "Software\Classes\*\shell\DeepDocEngine.DeepCheck"; ValueType: string; ValueName: ""; ValueData: "深度查密 (DeepDocEngine)"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\*\shell\DeepDocEngine.DeepCheck"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\App.UI.exe"",0"
+Root: HKCU; Subkey: "Software\Classes\*\shell\DeepDocEngine.DeepCheck\command"; ValueType: string; ValueName: ""; ValueData: """{app}\App.UI.exe"" --deep-check ""%1"""
+Root: HKCU; Subkey: "Software\Classes\*\shell\DeepDocEngine.DeepErase"; ValueType: string; ValueName: ""; ValueData: "深度擦除 (DeepDocEngine)"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\*\shell\DeepDocEngine.DeepErase"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\App.UI.exe"",0"
+Root: HKCU; Subkey: "Software\Classes\*\shell\DeepDocEngine.DeepErase\command"; ValueType: string; ValueName: ""; ValueData: """{app}\App.UI.exe"" --deep-erase ""%1"""
+
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\DeepDocEngine.DeepCheck"; ValueType: string; ValueName: ""; ValueData: "深度查密 (DeepDocEngine)"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\DeepDocEngine.DeepCheck"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\App.UI.exe"",0"
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\DeepDocEngine.DeepCheck\command"; ValueType: string; ValueName: ""; ValueData: """{app}\App.UI.exe"" --deep-check ""%1"""
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\DeepDocEngine.DeepErase"; ValueType: string; ValueName: ""; ValueData: "深度擦除 (DeepDocEngine)"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\DeepDocEngine.DeepErase"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\App.UI.exe"",0"
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\DeepDocEngine.DeepErase\command"; ValueType: string; ValueName: ""; ValueData: """{app}\App.UI.exe"" --deep-erase ""%1"""
+
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\DeepDocEngine.DeepCheck"; ValueType: string; ValueName: ""; ValueData: "深度查密 (DeepDocEngine)"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\DeepDocEngine.DeepCheck"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\App.UI.exe"",0"
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\DeepDocEngine.DeepCheck\command"; ValueType: string; ValueName: ""; ValueData: """{app}\App.UI.exe"" --deep-check ""%V"""
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\DeepDocEngine.DeepErase"; ValueType: string; ValueName: ""; ValueData: "深度擦除 (DeepDocEngine)"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\DeepDocEngine.DeepErase"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\App.UI.exe"",0"
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\DeepDocEngine.DeepErase\command"; ValueType: string; ValueName: ""; ValueData: """{app}\App.UI.exe"" --deep-erase ""%V"""
 
 [Code]
 procedure StopDeepDocProcesses();
