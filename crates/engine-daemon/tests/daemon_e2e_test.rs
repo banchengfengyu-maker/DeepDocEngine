@@ -734,4 +734,125 @@ mod windows_e2e {
         let _ = child_guard.0.wait();
         let _ = std::fs::remove_dir_all(&tmp_root);
     }
+
+    #[tokio::test]
+    async fn cancel_active_scan_stops_instantly_without_deadlock() {
+        let daemon_exe = workspace_bin("engine-daemon.exe");
+        let parser_exe = workspace_bin("parser-worker.exe");
+        let ext_exe = workspace_bin("ext-worker.exe");
+        if !daemon_exe.exists() || !parser_exe.exists() || !ext_exe.exists() {
+            return;
+        }
+
+        let pid = std::process::id();
+        let tmp_root = std::env::temp_dir().join(format!("deepdoc_cancel_test_{pid}"));
+        let _ = std::fs::remove_dir_all(&tmp_root);
+        let docs_dir = tmp_root.join("docs");
+        let data_dir = tmp_root.join("data");
+        std::fs::create_dir_all(&docs_dir).unwrap();
+
+        for i in 0..100 {
+            std::fs::write(
+                docs_dir.join(format!("file_{i}.txt")),
+                format!("test content file number {i} for cancellation responsiveness"),
+            )
+            .unwrap();
+        }
+
+        let pipe_name = format!(r"\\.\pipe\DeepDocEngine.cancel.{pid}");
+        let mut child_guard = ChildGuard(
+            Command::new(&daemon_exe)
+                .arg("--pipe")
+                .arg(&pipe_name)
+                .arg("--data-dir")
+                .arg(&data_dir)
+                .arg("--workers")
+                .arg("2")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn engine-daemon"),
+        );
+
+        let mut client = None;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(c) = ClientOptions::new().open(&pipe_name) {
+                client = Some(c);
+                break;
+            }
+        }
+        let client = client.expect("pipe client connected");
+        let (mut reader, mut writer) = tokio::io::split(client);
+
+        // Start scan
+        write_frame_async(
+            &mut writer,
+            &ClientEnvelope {
+                req_id: 1,
+                request: ClientRequest::StartScan {
+                    job_id: "job-cancel-test".into(),
+                    roots: vec![docs_dir.to_string_lossy().into_owned()],
+                    ruleset: None,
+                    options: ScanOptions::default(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        // Read StartScan Ack
+        match read_frame_async::<_, DaemonMessage>(&mut reader).await.unwrap() {
+            DaemonMessage::Ack { ok, .. } => assert!(ok),
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        // Send CancelScan immediately with wildcard "*"
+        write_frame_async(
+            &mut writer,
+            &ClientEnvelope {
+                req_id: 2,
+                request: ClientRequest::CancelScan { job_id: "*".into() },
+            },
+        )
+        .await
+        .unwrap();
+
+        let t_cancel = std::time::Instant::now();
+        let mut got_completed = false;
+        let mut was_cancelled = false;
+
+        while t_cancel.elapsed() < Duration::from_secs(5) {
+            match tokio::time::timeout(Duration::from_secs(2), read_frame_async::<_, DaemonMessage>(&mut reader)).await {
+                Ok(Ok(DaemonMessage::Ack { .. })) => {}
+                Ok(Ok(DaemonMessage::ScanProgress { .. })) => {}
+                Ok(Ok(DaemonMessage::ScanCompleted { summary, .. })) => {
+                    got_completed = true;
+                    was_cancelled = summary.cancelled;
+                    break;
+                }
+                Ok(Ok(other)) => {
+                    eprintln!("other message during cancel: {other:?}");
+                }
+                Ok(Err(e)) => panic!("pipe read err: {e}"),
+                Err(_) => break,
+            }
+        }
+
+        assert!(got_completed, "ScanCompleted must be received promptly after cancel");
+        assert!(was_cancelled, "summary.cancelled must be true");
+        assert!(t_cancel.elapsed() < Duration::from_secs(4), "cancellation must complete within seconds without deadlock");
+
+        // Clean shutdown
+        let _ = write_frame_async(
+            &mut writer,
+            &ClientEnvelope {
+                req_id: 3,
+                request: ClientRequest::Shutdown,
+            },
+        ).await;
+        let _ = child_guard.0.wait();
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
 }

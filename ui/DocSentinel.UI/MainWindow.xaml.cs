@@ -631,7 +631,26 @@ public partial class MainWindow : Window
 
         _client.OnDisconnected += msg => Dispatcher.Invoke(() =>
         {
-            SetConnectedBadge(false, $"连接断开: {msg}");
+            SetConnectedBadge(false, $"连接断开: {msg}（后台正在自动重连...）");
+            FooterStatusText.Text = "与后台引擎的连接已断开，正在尝试自动重连...";
+        });
+
+        _client.OnReconnected += () => Dispatcher.Invoke(async () =>
+        {
+            SetConnectedBadge(true, "本机后台内核已自动重连恢复");
+            FooterStatusText.Text = "后台引擎连接已自动恢复";
+            try
+            {
+                var pong = await _client.SendAsync(new JsonObject { ["type"] = "Ping" });
+                ulong activeJobs = pong["active_jobs"]?.AsUInt64() ?? 0;
+                _daemonHasRunningJob = activeJobs > 0;
+                if (!_daemonHasRunningJob && _activeJobId is not null)
+                {
+                    _activeJobId = null;
+                    SetJobUiBusy(false);
+                }
+            }
+            catch { }
         });
     }
 
@@ -2054,7 +2073,21 @@ public partial class MainWindow : Window
         MenuDirectSearch.IsEnabled = !busy;
         MenuCancelJob.IsEnabled = busy;
         BtnFooterCancel.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
+        if (!busy)
+        {
+            BtnFooterCancel.Content = "停止任务";
+            BtnFooterCancel.IsEnabled = true;
+        }
         ScanProgressBar.IsIndeterminate = busy;
+
+        if (busy)
+        {
+            DocSentinel.UI.Integration.PowerManager.PreventSleepAndEnableAwayMode();
+        }
+        else
+        {
+            DocSentinel.UI.Integration.PowerManager.RestoreNormalSleep();
+        }
     }
 
     private JsonObject BuildScanOptionsJson(bool? lowResourceOverride = null)
@@ -2288,16 +2321,48 @@ public partial class MainWindow : Window
 
     private async void MenuCancelJob_Click(object sender, RoutedEventArgs e)
     {
-        if (!_client.IsConnected) return;
-        string targetJob = _activeJobId ?? "*";
+        if (!_client.IsConnected)
+        {
+            _daemonHasRunningJob = false;
+            _activeJobId = null;
+            SetJobUiBusy(false);
+            FooterStatusText.Text = "当前未连接引擎，已重置本地任务状态";
+            return;
+        }
+
+        BtnFooterCancel.IsEnabled = false;
+        BtnFooterCancel.Content = "正在停止...";
+        MenuCancelJob.IsEnabled = false;
+        FooterStatusText.Text = "已发送停止信号，正在等待引擎完成当前批次释放并安全退出...";
+
         try
         {
-            await _client.SendAsync(new JsonObject { ["type"] = "CancelScan", ["job_id"] = targetJob });
+            // Send wildcard '*' cancellation to guarantee all active scan/index jobs stop
+            await _client.SendAsync(new JsonObject { ["type"] = "CancelScan", ["job_id"] = "*" });
             _daemonHasRunningJob = false;
-            if (_activeJobId is null)
-                SetJobUiBusy(false);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            FooterStatusText.Text = $"停止信号发送提示: {ex.Message}";
+        }
+
+        // Safety fallback timer: force unlock UI if daemon completion packet is delayed or dropped
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(2500);
+            await Dispatcher.InvokeAsync(() =>
+            {
+                if (_activeJobId is not null || _daemonHasRunningJob)
+                {
+                    _daemonHasRunningJob = false;
+                    _activeJobId = null;
+                    SetJobUiBusy(false);
+                    BtnFooterCancel.Content = "停止任务";
+                    BtnFooterCancel.IsEnabled = true;
+                    FooterStatusText.Text = "任务已停止";
+                }
+            });
+        });
     }
 
     private async void MenuClearIndex_Click(object sender, RoutedEventArgs e)

@@ -9,8 +9,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
     <PlatformTarget>x64</PlatformTarget>
-    <Version>0.10.0</Version>
-    <InformationalVersion>0.10.0</InformationalVersion>
+    <Version>0.11.0</Version>
+    <InformationalVersion>0.11.0</InformationalVersion>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
   </PropertyGroup>
 

@@ -9,5 +9,6 @@
     <Compile Include="..\..\ui\DocSentinel.UI\Ipc\MsgPackCodec.cs" Link="MsgPackCodec.cs" />
     <Compile Include="..\..\ui\DocSentinel.UI\Ipc\Models.cs" Link="Models.cs" />
     <Compile Include="..\..\ui\DocSentinel.UI\Ipc\DaemonPipeClient.cs" Link="DaemonPipeClient.cs" />
+    <Compile Include="..\..\ui\DocSentinel.UI\Integration\PowerManager.cs" Link="PowerManager.cs" />
   </ItemGroup>
 </Project>

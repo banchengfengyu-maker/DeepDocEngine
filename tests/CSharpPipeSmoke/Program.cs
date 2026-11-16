@@ -178,6 +178,17 @@ try
         if (ipcItems.Count != 1 || ipcItems[0].ModifiedUnixMs <= 0 || ipcItems[0].ByteSize == 0)
             throw new Exception($"DaemonPipeClient Search failed metadata check: count={ipcItems.Count}");
         Console.WriteLine($"[C# IPC] DaemonPipeClient verified OK: mtimeMs={ipcItems[0].ModifiedUnixMs}, size={ipcItems[0].ByteSize}");
+
+        // 4b. Verify PowerManager execution
+        DocSentinel.UI.Integration.PowerManager.PreventSleepAndEnableAwayMode();
+        DocSentinel.UI.Integration.PowerManager.RestoreNormalSleep();
+        Console.WriteLine("[C# IPC] PowerManager SetThreadExecutionState OK");
+
+        // 4c. Verify CancelScan via DaemonPipeClient
+        var cancelAck = await ipcClient.SendAsync(new JsonObject { ["type"] = "CancelScan", ["job_id"] = "*" });
+        if (cancelAck["type"]?.AsStr() != "Ack")
+            throw new Exception($"CancelScan Ack expected, got {cancelAck}");
+        Console.WriteLine("[C# IPC] DaemonPipeClient CancelScan wildcard OK");
     }
 
     // 5. Shutdown

@@ -213,6 +213,28 @@ fn build_cross_uac_pipe_sd() -> Option<PipeSecurityHolder> {
 }
 
 #[cfg(windows)]
+pub fn prevent_sleep_and_enable_away_mode(prevent: bool) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetThreadExecutionState(es_flags: u32) -> u32;
+    }
+    const ES_CONTINUOUS: u32 = 0x8000_0000;
+    const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+    const ES_AWAYMODE_REQUIRED: u32 = 0x0000_0040;
+
+    unsafe {
+        if prevent {
+            SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED);
+        } else {
+            SetThreadExecutionState(ES_CONTINUOUS);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn prevent_sleep_and_enable_away_mode(_prevent: bool) {}
+
+#[cfg(windows)]
 fn create_pipe_instance(
     pipe_name: &str,
     first: bool,
@@ -248,8 +270,23 @@ async fn run_named_pipe_server(
     shutdown_notify: Arc<tokio::sync::Notify>,
 ) {
     let sd_holder = build_cross_uac_pipe_sd();
-    let mut server = create_pipe_instance(&pipe_name, true, sd_holder.as_ref())
-        .expect("failed to create initial Named Pipe instance");
+    let mut initial_retries = 0;
+    let mut server = loop {
+        match create_pipe_instance(&pipe_name, true, sd_holder.as_ref()) {
+            Ok(s) => break s,
+            Err(e) if initial_retries < 5 => {
+                initial_retries += 1;
+                eprintln!("[engine-daemon] initial pipe create retry {initial_retries}/5: {e}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => {
+                if let Ok(s) = create_pipe_instance(&pipe_name, false, sd_holder.as_ref()) {
+                    break s;
+                }
+                panic!("failed to create initial Named Pipe instance `{pipe_name}`: {e}");
+            }
+        }
+    };
 
     loop {
         tokio::select! {
@@ -263,13 +300,25 @@ async fn run_named_pipe_server(
                     continue;
                 }
                 let connected_pipe = server;
-                match create_pipe_instance(&pipe_name, false, sd_holder.as_ref()) {
-                    Ok(next) => server = next,
-                    Err(e) => {
-                        eprintln!("[engine-daemon] recreate pipe failed: {e}");
-                        break;
+                let mut retry_count = 0;
+                let next_server = loop {
+                    match create_pipe_instance(&pipe_name, false, sd_holder.as_ref()) {
+                        Ok(next) => break Some(next),
+                        Err(e) if retry_count < 10 => {
+                            retry_count += 1;
+                            eprintln!("[engine-daemon] recreate pipe retry {retry_count}/10: {e}");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        Err(e) => {
+                            eprintln!("[engine-daemon] recreate pipe failed permanently after retries: {e}");
+                            break None;
+                        }
                     }
-                }
+                };
+                let Some(next) = next_server else {
+                    break;
+                };
+                server = next;
                 let st = state.clone();
                 tokio::spawn(async move {
                     handle_client(connected_pipe, st).await;
@@ -374,6 +423,7 @@ async fn handle_client(
                 {
                     let mut jobs = st_clone.active_jobs.lock().await;
                     jobs.insert(job_id.clone(), cancel.clone());
+                    prevent_sleep_and_enable_away_mode(true);
                 }
                 let _ = tx_clone
                     .send(DaemonMessage::Ack {
@@ -418,6 +468,7 @@ async fn handle_client(
                         }
                     }
                     jobs.insert(job_id.clone(), cancel.clone());
+                    prevent_sleep_and_enable_away_mode(true);
                 }
                 let _ = tx_clone
                     .send(DaemonMessage::Ack {
@@ -690,6 +741,7 @@ async fn handle_client(
                         }
                     }
                     jobs.insert(job_id.clone(), cancel.clone());
+                    prevent_sleep_and_enable_away_mode(true);
                 }
                 let _ = tx_clone
                     .send(DaemonMessage::Ack {
@@ -831,6 +883,7 @@ async fn finish_job_and_shrink(state: &DaemonState, job_id: &str) {
         jobs.is_empty()
     };
     if no_active_jobs {
+        prevent_sleep_and_enable_away_mode(false);
         state.parser_pool.set_low_resource(false).await;
         state.parser_pool.shrink_idle(0).await;
         if let Some(ep) = &state.ext_pool {
@@ -1369,7 +1422,53 @@ async fn run_scan_job(
         }
     }
 
+    let is_cancelled_s1 = cancel.load(Ordering::SeqCst);
+    if is_cancelled_s1 {
+        join_set.abort_all();
+    }
+    // Drop receiver explicitly so disc_tx.blocking_send fails with SendError and causes discovery worker to terminate immediately
+    drop(disc_rx);
+
     let (usn_updates, removed_via_usn) = disc_handle.await.unwrap_or_default();
+
+    if is_cancelled_s1 {
+        if !batch.is_empty() || !pending_ocr_cache.is_empty() {
+            let drained = std::mem::take(&mut batch);
+            let ocr_drained = std::mem::take(&mut pending_ocr_cache);
+            let _ = idx_tx.send(IndexPipelineMsg::Flush(drained, ocr_drained)).await;
+        }
+        drop(idx_tx);
+        let _ = indexer_handle.await;
+
+        let st_commit = state.store.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = st_commit.commit_and_release();
+        })
+        .await;
+
+        finish_job_and_shrink(&state, &job_id).await;
+
+        send_with_timeout(
+            &tx,
+            DaemonMessage::ScanCompleted {
+                job_id: job_id.clone(),
+                summary: ScanSummary {
+                    job_id,
+                    scanned_files,
+                    parsed_ok,
+                    child_docs_indexed,
+                    skipped_cached,
+                    encrypted_files,
+                    failed_files,
+                    rule_hits,
+                    elapsed_ms: t0.elapsed().as_millis() as u64,
+                    cancelled: true,
+                },
+            },
+        )
+        .await;
+        return;
+    }
 
     if !cached_eval_ids.is_empty() {
         if let Some(ref compiled) = compiled_rules {
@@ -1674,6 +1773,42 @@ async fn run_scan_job(
             let drained = std::mem::take(&mut batch);
             let ocr_drained = std::mem::take(&mut pending_ocr_cache);
             let _ = idx_tx.send(IndexPipelineMsg::Flush(drained, ocr_drained)).await;
+        }
+
+        let is_cancelled_s2 = cancel.load(Ordering::SeqCst);
+        if is_cancelled_s2 {
+            join_set.abort_all();
+            drop(idx_tx);
+            let _ = indexer_handle.await;
+
+            let st_commit = state.store.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = st_commit.commit_and_release();
+            })
+            .await;
+
+            finish_job_and_shrink(&state, &job_id).await;
+
+            send_with_timeout(
+                &tx,
+                DaemonMessage::ScanCompleted {
+                    job_id: job_id.clone(),
+                    summary: ScanSummary {
+                        job_id,
+                        scanned_files,
+                        parsed_ok,
+                        child_docs_indexed,
+                        skipped_cached,
+                        encrypted_files,
+                        failed_files,
+                        rule_hits,
+                        elapsed_ms: t0.elapsed().as_millis() as u64,
+                        cancelled: true,
+                    },
+                },
+            )
+            .await;
+            return;
         }
     }
 
@@ -1981,6 +2116,11 @@ async fn run_direct_search_job(
     let mut last_progress = Instant::now();
 
     loop {
+        if cancel.load(Ordering::SeqCst) {
+            join_set.abort_all();
+            break;
+        }
+
         while join_set.len() < max_in_flight && !cancel.load(Ordering::SeqCst) {
             let Some(entry) = iter.next() else {
                 break;

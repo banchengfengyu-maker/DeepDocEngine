@@ -24,11 +24,19 @@ public sealed class DaemonPipeClient : IAsyncDisposable
     public event Action<JsonObject>? OnDeepDeleteProgress;
     public event Action<JsonObject>? OnDeepDeleteCompleted;
     public event Action<string>? OnDisconnected;
+    public event Action? OnReconnected;
 
     public bool IsConnected => _pipe is { IsConnected: true };
 
+    private string _lastPipeName = DefaultPipeName;
+    private string? _lastDataDir;
+    private CancellationTokenSource? _reconnectCts;
+
     public async Task ConnectOrStartDaemonAsync(string pipeName = DefaultPipeName, string? dataDir = null, bool forceReconnect = false, CancellationToken ct = default)
     {
+        _lastPipeName = pipeName;
+        _lastDataDir = dataDir;
+
         if (!forceReconnect && IsConnected)
             return;
 
@@ -39,9 +47,35 @@ public sealed class DaemonPipeClient : IAsyncDisposable
         bool alreadyRunning = isDefaultPipe && Process.GetProcessesByName("engine-daemon").Length > 0;
         var connStatus = await TryConnectWithStatusAsync(pipeName, alreadyRunning ? 1500 : 120, ct);
         if (connStatus == PipeTryConnectResult.Connected)
+        {
+            CancelReconnectLoop();
             return;
+        }
         if (connStatus == PipeTryConnectResult.AccessDenied)
             throw new UnauthorizedAccessException("检测到后台 engine-daemon 正在以管理员权限运行，当前普通权限窗口无权连接（请退出旧管理员进程或升级重启后再试）。");
+
+        // If alreadyRunning is true, but connecting failed, the existing engine-daemon is an unresponsive zombie
+        // from an abnormal crash, kill or pipe hang. Clean it up so the fresh daemon can bind the pipe and database cleanly.
+        if (alreadyRunning && connStatus != PipeTryConnectResult.Connected)
+        {
+            try
+            {
+                foreach (var p in Process.GetProcessesByName("engine-daemon"))
+                {
+                    try { p.Kill(entireProcessTree: true); p.WaitForExit(1000); } catch { }
+                }
+                foreach (var p in Process.GetProcessesByName("parser-worker"))
+                {
+                    try { p.Kill(); } catch { }
+                }
+                foreach (var p in Process.GetProcessesByName("ext-worker"))
+                {
+                    try { p.Kill(); } catch { }
+                }
+            }
+            catch { }
+            await Task.Delay(300, ct); // Allow OS kernel to release pipe and socket handles
+        }
 
         // Auto-spawn sibling engine-daemon.exe if available
         string baseDir = AppContext.BaseDirectory;
@@ -185,6 +219,7 @@ public sealed class DaemonPipeClient : IAsyncDisposable
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             OnDisconnected?.Invoke(ex.Message);
+            StartReconnectLoop();
         }
         finally
         {
@@ -196,10 +231,57 @@ public sealed class DaemonPipeClient : IAsyncDisposable
         }
     }
 
-    public async Task<JsonObject> SendAsync(JsonObject requestObj, CancellationToken ct = default)
+    private void StartReconnectLoop()
+    {
+        CancelReconnectLoop();
+        _reconnectCts = new CancellationTokenSource();
+        var token = _reconnectCts.Token;
+
+        _ = Task.Run(async () =>
+        {
+            int delayMs = 1000;
+            while (!token.IsCancellationRequested && !IsConnected)
+            {
+                try
+                {
+                    await Task.Delay(delayMs, token);
+                    await ConnectOrStartDaemonAsync(_lastPipeName, _lastDataDir, forceReconnect: true, ct: token);
+                    if (IsConnected)
+                    {
+                        OnReconnected?.Invoke();
+                        break;
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch
+                {
+                    delayMs = Math.Min(delayMs * 2, 5000);
+                }
+            }
+        }, token);
+    }
+
+    private void CancelReconnectLoop()
+    {
+        var rcts = Interlocked.Exchange(ref _reconnectCts, null);
+        if (rcts is not null)
+        {
+            try { rcts.Cancel(); rcts.Dispose(); } catch { }
+        }
+    }
+
+    public async Task<JsonObject> SendAsync(JsonObject requestObj, CancellationToken ct = default, int timeoutMs = 15000)
     {
         if (_pipe is null || !_pipe.IsConnected)
             throw new InvalidOperationException("Daemon pipe not connected");
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        if (timeoutMs > 0)
+            linkedCts.CancelAfter(timeoutMs);
+        var effectiveCt = linkedCts.Token;
 
         ulong reqId = Interlocked.Increment(ref _nextReqId);
         var tcs = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -211,17 +293,17 @@ public sealed class DaemonPipeClient : IAsyncDisposable
             ["request"] = requestObj
         };
 
-        await _writeLock.WaitAsync(ct);
+        await _writeLock.WaitAsync(effectiveCt);
         try
         {
-            await MsgPackCodec.WriteFrameAsync(_pipe, env, ct);
+            await MsgPackCodec.WriteFrameAsync(_pipe, env, effectiveCt);
         }
         finally
         {
             _writeLock.Release();
         }
 
-        using var reg = ct.Register(() => tcs.TrySetCanceled(ct));
+        using var reg = effectiveCt.Register(() => tcs.TrySetCanceled(effectiveCt));
         var resp = await tcs.Task;
         if (resp["type"]?.AsStr() == "Error")
         {
@@ -232,6 +314,7 @@ public sealed class DaemonPipeClient : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        CancelReconnectLoop();
         await ResetConnectionAsync();
         _writeLock.Dispose();
     }
