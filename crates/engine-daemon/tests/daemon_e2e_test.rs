@@ -461,6 +461,7 @@ mod windows_e2e {
                     job_id: "job-del".into(),
                     paths: vec![victim_file.to_string_lossy().into_owned()],
                     cancel_active_jobs: false,
+                    wipe_mode: None,
                 },
             },
         )
@@ -505,6 +506,41 @@ mod windows_e2e {
             DaemonMessage::SearchResult { total_hits, .. } => assert_eq!(total_hits, 0),
             other => panic!("expected 0 hits after deep delete, got {other:?}"),
         }
+
+        // Verify NIST 800-88 zero_wipe mode succeeds and wipes disk cleanly
+        let zero_victim = tmp_root.join("zero_wipe_victim.txt");
+        std::fs::write(&zero_victim, "sensitive zero wipe text payload").unwrap();
+        write_frame_async(
+            &mut writer,
+            &ClientEnvelope {
+                req_id: 140,
+                request: ClientRequest::DeepDeleteFiles {
+                    job_id: "job-del-zero".into(),
+                    paths: vec![zero_victim.to_string_lossy().into_owned()],
+                    cancel_active_jobs: false,
+                    wipe_mode: Some("zero_wipe".into()),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        loop {
+            match read_frame_async::<_, DaemonMessage>(&mut reader).await.unwrap() {
+                DaemonMessage::Ack { ok, .. } => assert!(ok),
+                DaemonMessage::DeepDeleteProgress { .. } => {}
+                DaemonMessage::DeepDeleteCompleted {
+                    deleted_files,
+                    skipped_or_failed,
+                    ..
+                } => {
+                    assert_eq!(deleted_files, 1);
+                    assert_eq!(skipped_or_failed, 0);
+                    break;
+                }
+                other => panic!("unexpected during zero DeepDeleteFiles: {other:?}"),
+            }
+        }
+        assert!(!zero_victim.exists(), "zero_victim must be wiped off disk");
 
         // Verify ResetIndexKeepOcr ack succeeds cleanly
         write_frame_async(
@@ -663,6 +699,7 @@ mod windows_e2e {
                     job_id: "job-del-dir".into(),
                     paths: vec![secret_dir.to_string_lossy().into_owned()],
                     cancel_active_jobs: true,
+                    wipe_mode: None,
                 },
             },
         )

@@ -1,0 +1,76 @@
+<Window x:Class="DocSentinel.UI.Dialogs.DeepDeleteConfirmWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="高危确认：文件与目录彻底销毁"
+        Width="660" Height="520" MinWidth="540" MinHeight="420"
+        WindowStartupLocation="CenterOwner"
+        Background="#F8FAFC"
+        FontFamily="Microsoft YaHei UI, Segoe UI">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- Top Warning Banner -->
+        <Border Grid.Row="0" Background="#FEF2F2" BorderBrush="#FCA5A5" BorderThickness="1" CornerRadius="6" Padding="12,10" Margin="0,0,0,12">
+            <DockPanel LastChildFill="True">
+                <TextBlock Text="⚠️" FontSize="20" VerticalAlignment="Center" Margin="0,0,10,0" />
+                <StackPanel>
+                    <TextBlock Text="永久销毁确认（不进回收站，不可恢复）" FontWeight="Bold" FontSize="13" Foreground="#991B1B" />
+                    <TextBlock Text="目标文件/目录将被彻底删除，并同步从 DeepDocEngine 本地全文索引库中抹除记录与检索段数据。"
+                               FontSize="11.5" Foreground="#B91C1C" Margin="0,2,0,0" TextWrapping="Wrap" />
+                </StackPanel>
+            </DockPanel>
+        </Border>
+
+        <!-- Middle: File list preview -->
+        <DockPanel Grid.Row="1" Margin="0,0,0,12">
+            <TextBlock x:Name="TxtSummary" DockPanel.Dock="Top" Text="待销毁目标列表：" FontWeight="SemiBold" FontSize="12" Foreground="#1E293B" Margin="0,0,0,6" />
+            <Border BorderBrush="#CBD5E1" BorderThickness="1" CornerRadius="4" Background="#FFFFFF">
+                <TextBox x:Name="TxtPathsList" IsReadOnly="True" TextWrapping="NoWrap"
+                         VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                         BorderThickness="0" Background="Transparent" Padding="8"
+                         FontFamily="Consolas, Microsoft YaHei UI" FontSize="11.5" Foreground="#334155" />
+            </Border>
+        </DockPanel>
+
+        <!-- Mode selection -->
+        <Border Grid.Row="2" Background="#FFFFFF" BorderBrush="#E2E8F0" BorderThickness="1" CornerRadius="6" Padding="12" Margin="0,0,0,14">
+            <StackPanel>
+                <TextBlock Text="销毁模式选择（企业杀毒与终端 EDR 兼容）：" FontWeight="SemiBold" FontSize="12" Foreground="#0F172A" Margin="0,0,0,8" />
+
+                <!-- Option 1: Direct Permanent Delete -->
+                <RadioButton x:Name="RbDirect" IsChecked="True" GroupName="WipeModeGroup" Margin="0,0,0,10">
+                    <StackPanel Margin="4,0,0,0">
+                        <TextBlock Text="直接彻底销毁（推荐，100% 免疫奇安信天擎/杀软误报）" FontWeight="SemiBold" FontSize="12.5" Foreground="#0F172A" />
+                        <TextBlock Text="解除只读保护后直接调用系统底层删除接口彻底移除文件与目录并抹除索引。不覆写文件扇区、不进行任何临时重命名，100% 杜绝奇安信天擎、360、深信服等企业级安全软件将覆写/改名判定为【勒索病毒/文档防篡改】。"
+                                   FontSize="11" Foreground="#64748B" TextWrapping="Wrap" Margin="0,2,0,0" LineHeight="16" />
+                    </StackPanel>
+                </RadioButton>
+
+                <!-- Option 2: NIST 800-88 Zero Wipe -->
+                <RadioButton x:Name="RbZeroWipe" GroupName="WipeModeGroup">
+                    <StackPanel Margin="4,0,0,0">
+                        <TextBlock Text="合规零值粉碎（NIST SP 800-88 单遍 0x00 覆写，无重命名）" FontWeight="SemiBold" FontSize="12.5" Foreground="#0F172A" />
+                        <TextBlock Text="以单遍 0x00 清零覆写文档内容后直接删除（去除改名特征）。适用于涉密或物理扇区合规审计。注意：若您的企业电脑部署了奇安信天擎且开启了【文档防篡改/防勒索】写保护，修改办公文档可能会被天擎拦截。若被拦截请使用【直接彻底销毁】。"
+                                   FontSize="11" Foreground="#64748B" TextWrapping="Wrap" Margin="0,2,0,0" LineHeight="16" />
+                    </StackPanel>
+                </RadioButton>
+            </StackPanel>
+        </Border>
+
+        <!-- Bottom buttons -->
+        <DockPanel Grid.Row="3" LastChildFill="False">
+            <TextBlock DockPanel.Dock="Left" Text="提示：如遇文件被占用，引擎将自动重试 4 次" FontSize="11" Foreground="#94A3B8" VerticalAlignment="Center" />
+            <StackPanel Orientation="Horizontal" DockPanel.Dock="Right">
+                <Button Content="取消" Width="80" IsCancel="True" Margin="0,0,10,0" />
+                <Button x:Name="BtnConfirmDelete" Content="确认彻底销毁" Style="{StaticResource DangerOutlineButton}"
+                        Background="#DC2626" Foreground="#FFFFFF" BorderBrush="#B91C1C" FontWeight="Bold"
+                        Padding="16,6" Click="BtnConfirmDelete_Click" />
+            </StackPanel>
+        </DockPanel>
+    </Grid>
+</Window>

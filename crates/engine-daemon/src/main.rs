@@ -731,6 +731,7 @@ async fn handle_client(
                 job_id,
                 paths,
                 cancel_active_jobs,
+                wipe_mode,
             } => {
                 let cancel = Arc::new(AtomicBool::new(false));
                 {
@@ -756,6 +757,7 @@ async fn handle_client(
                         job_id,
                         paths,
                         cancel_active_jobs,
+                        wipe_mode,
                         cancel,
                         tx_clone,
                     )
@@ -3309,12 +3311,20 @@ fn collect_directory_deep_delete_plan(
     (files, sorted_dirs, skipped_errs)
 }
 
-/// Gentle, zero-entropy 3-pass wipe (0xAA -> 0x55 -> 0x00 + truncate + rename + unlink).
-/// Paced slowly using sequential standard file writes with low Shannon entropy so Windows Defender,
-/// Huorong, 360, etc. do not misclassify it as ransomware burst encryption.
-fn deep_wipe_file_safely(path: &Path, cancel: &AtomicBool, seq: u64) -> Result<(), String> {
+/// Deletes a file safely off disk without triggering enterprise EDR / TianQing ransomware false-positives.
+///
+/// If `zero_wipe` is true: performs single-pass 0x00 zero-filling (NIST SP 800-88 Clear compliant)
+/// before unlinking.
+/// If `zero_wipe` is false (default / direct mode): clears readonly attributes and unlinks directly
+/// via `std::fs::remove_file` (Win32 `DeleteFileW`).
+///
+/// CRITICAL: Absolutely NO file renaming (e.g. `~deepdoc_clean_*.tmp`) is performed!
+/// Renaming documents after write/open is the primary heuristic trigger for ransomware detection
+/// in QiAnXin TianQing (奇安信天擎) and other enterprise EDRs.
+fn deep_wipe_file_safely(path: &Path, cancel: &AtomicBool, zero_wipe: bool) -> Result<(), String> {
     use std::io::{Seek, SeekFrom, Write};
 
+    // 1. Clear readonly flag if present
     if let Ok(meta) = std::fs::metadata(path) {
         let mut perms = meta.permissions();
         if perms.readonly() {
@@ -3323,12 +3333,13 @@ fn deep_wipe_file_safely(path: &Path, cancel: &AtomicBool, seq: u64) -> Result<(
         }
     }
 
-    {
+    // 2. If NIST 800-88 single-pass zero wipe is requested:
+    if zero_wipe {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
-            .map_err(|e| format!("打开待擦除文件失败 `{}`: {e}", path.display()))?;
+            .map_err(|e| format!("打开待清零文件失败 `{}`: {e}", path.display()))?;
 
         let total_len = file
             .metadata()
@@ -3337,71 +3348,58 @@ fn deep_wipe_file_safely(path: &Path, cancel: &AtomicBool, seq: u64) -> Result<(
 
         if total_len > 0 {
             const CHUNK: usize = 64 * 1024;
-            let patterns = [0xAAu8, 0x55u8, 0x00u8];
-            let mut buf = vec![0u8; CHUNK];
+            let buf = vec![0u8; CHUNK];
+            file.seek(SeekFrom::Start(0))
+                .map_err(|e| format!("文件定位失败: {e}"))?;
 
-            for (pass_idx, &byte_pat) in patterns.iter().enumerate() {
+            let mut remaining = total_len;
+            let mut chunks_since_pace = 0usize;
+            while remaining > 0 {
                 if cancel.load(Ordering::SeqCst) {
-                    // If user requested stop before starting next pass, keep zeroed safety check:
-                    // finish a single clean zero pass only if already modified, otherwise leave abort clean.
-                    if pass_idx > 0 && byte_pat != 0x00 {
-                        buf.fill(0x00);
-                        let _ = file.seek(SeekFrom::Start(0));
-                        let mut rem = total_len;
-                        while rem > 0 {
-                            let n = (rem as usize).min(CHUNK);
-                            let _ = file.write_all(&buf[..n]);
-                            rem -= n as u64;
-                        }
-                        let _ = file.sync_all();
-                        return Err("用户已取消深度删除".into());
-                    } else if pass_idx == 0 {
-                        return Err("用户已取消深度删除".into());
-                    }
+                    let _ = file.sync_all();
+                    return Err("用户已取消深度删除".into());
                 }
-
-                buf.fill(byte_pat);
-                file.seek(SeekFrom::Start(0))
-                    .map_err(|e| format!("文件定位失败: {e}"))?;
-                let mut remaining = total_len;
-                let mut chunks_since_pace = 0usize;
-                while remaining > 0 {
-                    let n = (remaining as usize).min(CHUNK);
-                    file.write_all(&buf[..n])
-                        .map_err(|e| format!("安全覆写失败: {e}"))?;
-                    remaining -= n as u64;
-                    chunks_since_pace += 1;
-                    if chunks_since_pace >= 16 {
-                        // ~1 MiB written -> flush calmly & yield I/O so AV / foreground stay smooth
-                        chunks_since_pace = 0;
-                        let _ = file.flush();
-                        std::thread::sleep(Duration::from_millis(8));
-                    }
+                let n = (remaining as usize).min(CHUNK);
+                file.write_all(&buf[..n])
+                    .map_err(|e| format!("清零覆写失败: {e}"))?;
+                remaining -= n as u64;
+                chunks_since_pace += 1;
+                if chunks_since_pace >= 16 {
+                    chunks_since_pace = 0;
+                    let _ = file.flush();
+                    std::thread::yield_now();
                 }
-                let _ = file.sync_data();
-                std::thread::sleep(Duration::from_millis(25));
             }
+            let _ = file.sync_data();
         }
 
         let _ = file.set_len(0);
         let _ = file.sync_all();
+        drop(file);
     }
 
-    let delete_target = if let Some(parent) = path.parent() {
-        let tmp_name = format!("~deepdoc_clean_{}_{seq}.tmp", std::process::id());
-        let renamed = parent.join(tmp_name);
-        if std::fs::rename(path, &renamed).is_ok() {
-            renamed
-        } else {
-            path.to_path_buf()
+    // 3. Directly remove file via standard OS unlink (DeleteFileW).
+    // NO rename to ~deepdoc_clean_*.tmp! Renaming is the #1 heuristic signature for ransomware in EDRs!
+    let mut last_err = None;
+    for attempt in 0..4 {
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
         }
-    } else {
-        path.to_path_buf()
-    };
+    }
 
-    std::fs::remove_file(&delete_target)
-        .map_err(|e| format!("移除文件句柄失败 `{}`: {e}", delete_target.display()))?;
-    std::thread::sleep(Duration::from_millis(120));
+    if let Some(e) = last_err {
+        return Err(format!("彻底移除文件失败 `{}`: {e}", path.display()));
+    }
+
     Ok(())
 }
 
@@ -3410,6 +3408,7 @@ async fn run_deep_delete_job(
     job_id: String,
     paths: Vec<String>,
     cancel_active_jobs: bool,
+    wipe_mode: Option<String>,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DaemonMessage>,
 ) {
@@ -3417,6 +3416,7 @@ async fn run_deep_delete_job(
         preempt_other_active_jobs(&state, &job_id, &cancel).await;
     }
 
+    let is_zero_wipe = matches!(wipe_mode.as_deref(), Some("zero_wipe" | "zero" | "overwrite"));
     let store_clone = state.store.clone();
     let cancel_clone = cancel.clone();
     let tx_prog = tx.clone();
@@ -3487,7 +3487,7 @@ async fn run_deep_delete_job(
                             },
                         );
                         seq += 1;
-                        match deep_wipe_file_safely(&disk, &cancel_clone, seq) {
+                        match deep_wipe_file_safely(&disk, &cancel_clone, is_zero_wipe) {
                             Ok(()) => {
                                 ok_cnt += 1;
                                 wiped_files.push(orig);
@@ -3523,7 +3523,7 @@ async fn run_deep_delete_job(
                                 },
                             );
                             seq += 1;
-                            match deep_wipe_file_safely(&f, &cancel_clone, seq) {
+                            match deep_wipe_file_safely(&f, &cancel_clone, is_zero_wipe) {
                                 Ok(()) => {
                                     ok_cnt += 1;
                                     wiped_files.push(clean_disp);
@@ -3536,22 +3536,26 @@ async fn run_deep_delete_job(
                             }
                         }
                         if folder_ok && !cancel_clone.load(Ordering::SeqCst) {
-                            for (d_idx, sub) in subdirs.into_iter().enumerate() {
-                                let del_dir = if let Some(parent) = sub.parent() {
-                                    let tmp = format!("~deepdoc_dir_{}_{d_idx}.tmp", std::process::id());
-                                    let renamed = parent.join(tmp);
-                                    if std::fs::rename(&sub, &renamed).is_ok() {
-                                        renamed
-                                    } else {
-                                        sub
+                            for sub in subdirs {
+                                let mut last_err = None;
+                                for attempt in 0..4 {
+                                    match std::fs::remove_dir(&sub) {
+                                        Ok(()) => {
+                                            last_err = None;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            last_err = Some(e);
+                                            if attempt < 3 {
+                                                std::thread::sleep(Duration::from_millis(50));
+                                            }
+                                        }
                                     }
-                                } else {
-                                    sub
-                                };
-                                if let Err(e) = std::fs::remove_dir(&del_dir) {
+                                }
+                                if let Some(e) = last_err {
                                     folder_ok = false;
                                     err_cnt += 1;
-                                    errs.push(format!("移除空目录失败 `{}`: {e}", del_dir.display()));
+                                    errs.push(format!("移除目录失败 `{}`: {e}", sub.display()));
                                 }
                             }
                         }

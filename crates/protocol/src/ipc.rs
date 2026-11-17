@@ -135,12 +135,14 @@ pub enum ClientRequest {
     ClearIndex,
     /// Rebuild/reset document & Tantivy index while keeping persistent `ocr_image_cache`.
     ResetIndexKeepOcr,
-    /// Gentle, AV-friendly multi-pass secure file/folder erasure + index purge.
+    /// Gentle, AV-friendly secure file/folder erasure + index purge.
     DeepDeleteFiles {
         job_id: String,
         paths: Vec<String>,
         #[serde(default)]
         cancel_active_jobs: bool,
+        #[serde(default)]
+        wipe_mode: Option<String>,
     },
     Shutdown,
 }

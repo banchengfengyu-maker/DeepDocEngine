@@ -592,7 +592,7 @@ public partial class MainWindow : Window
             ulong done = obj["completed"].AsUInt64();
             ulong total = obj["total"].AsUInt64();
             string cur = obj["current_path"].AsStr();
-            FooterStatusText.Text = $"深度擦除中 ({done}/{total}) — 慢速低熵三遍覆写防杀软误报: {cur}";
+            FooterStatusText.Text = $"彻底销毁中 ({done}/{total}): {cur}";
         });
 
         _client.OnDeepDeleteCompleted += obj => Dispatcher.Invoke(async () =>
@@ -616,11 +616,11 @@ public partial class MainWindow : Window
                 }
                 PreviewBox.Document.Blocks.Clear();
                 PreviewHeader.Text = "文件内容预览";
-                PreviewSubHeader.Text = "选中文件/目录已被深度擦除并从索引库抹除";
+                PreviewSubHeader.Text = "选中文件/目录已被彻底销毁并从索引库抹除";
                 HitNavText.Text = "0 / 0";
             }
             _pendingDeleteTargets.Clear();
-            FooterStatusText.Text = $"深度擦除完成: 粉碎 {wiped} 个文件, 同步抹除索引 {purged} 条, 跳过/失败 {skipped} 条";
+            FooterStatusText.Text = $"彻底销毁完成: 已销毁 {wiped} 个文件, 同步抹除索引 {purged} 条, 跳过/失败 {skipped} 条";
             await RefreshStatsSafeAsync();
 
             if (errs.Count > 0)
@@ -1973,7 +1973,7 @@ public partial class MainWindow : Window
         if (innerWarnings.Count == selected.Count)
         {
             MessageBox.Show(
-                "选中的条目均位于压缩包内部，为防止误粉碎整个归档文件已阻止。\n如需彻底擦除外层压缩包，请从菜单【查密与擦除 -> 对文件执行深度擦除...】选取该归档。",
+                "选中的条目均位于压缩包内部，为防止误粉碎整个归档文件已阻止。\n如需彻底销毁外层压缩包，请从菜单【查密与擦除 -> 对文件执行彻底销毁...】选取该归档。",
                 "安全提示", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
@@ -1984,7 +1984,7 @@ public partial class MainWindow : Window
     {
         var dlg = new OpenFileDialog
         {
-            Title = "选择要深度擦除的文件（不进回收站，慢速防杀软三遍覆写）",
+            Title = "选择要彻底销毁的文件（安全粉碎，免天擎/杀软误报，不进回收站）",
             Multiselect = true
         };
         if (dlg.ShowDialog() == true && dlg.FileNames.Length > 0)
@@ -1995,7 +1995,7 @@ public partial class MainWindow : Window
     {
         var dlg = new OpenFolderDialog
         {
-            Title = "选择要深度擦除的文件夹（将三遍覆写粉碎内部全部文件并清除目录，不可恢复）",
+            Title = "选择要彻底销毁的文件夹（递归安全粉碎，免天擎/杀软误报，不进回收站）",
             Multiselect = true
         };
         if (dlg.ShowDialog() == true && dlg.FolderNames.Length > 0)
@@ -2016,18 +2016,14 @@ public partial class MainWindow : Window
             return;
         }
 
-        var lines = paths.Take(8).Select(p => Directory.Exists(p) ? $"[文件夹及全部内部文件] {p}" : $"[文件] {p}").ToList();
-        string previewList = string.Join("\n", lines);
-        if (paths.Count > 8) previewList += $"\n... 等共 {paths.Count} 项";
-        bool hasDir = paths.Any(Directory.Exists);
-        string dirWarn = hasDir ? "\n⚠️ 注意：所选目标包含文件夹，将递归彻底擦除其下所有子文件夹与文件！\n" : "\n";
-
-        if (MessageBox.Show(
-                $"确定执行【深度擦除】以下 {paths.Count} 项目标？\n\n{previewList}\n{dirWarn}\n" +
-                "• 采用 3 遍低熵值（0xAA → 0x55 → 0x00）温和慢速覆写并改名擦除，尽量避免触发杀毒软件拦截。\n" +
-                "• 擦除后同步从 DeepDocEngine 本地索引库中彻底抹除（含 SQLite VACUUM 与倒排段合并），不进回收站且不可恢复！",
-                "高危确认：深度擦除", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes)
+        var confirmDlg = new DocSentinel.UI.Dialogs.DeepDeleteConfirmWindow(paths)
+        {
+            Owner = this
+        };
+        if (confirmDlg.ShowDialog() != true || !confirmDlg.Confirmed)
             return;
+
+        string wipeMode = confirmDlg.WipeMode;
 
         if (_activeJobId is not null || _daemonHasRunningJob)
             await StopAllActiveDaemonJobsAsync();
@@ -2046,7 +2042,8 @@ public partial class MainWindow : Window
                 ["type"] = "DeepDeleteFiles",
                 ["job_id"] = _activeJobId,
                 ["paths"] = pArr,
-                ["cancel_active_jobs"] = true
+                ["cancel_active_jobs"] = true,
+                ["wipe_mode"] = wipeMode
             });
         }
         catch (Exception ex)
@@ -2054,7 +2051,7 @@ public partial class MainWindow : Window
             _activeJobId = null;
             _pendingDeleteTargets.Clear();
             SetJobUiBusy(false);
-            MessageBox.Show(ex.Message, "启动深度擦除失败", MessageBoxButton.OK, MessageBoxImage.Error);
+            MessageBox.Show(ex.Message, "启动彻底销毁失败", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 

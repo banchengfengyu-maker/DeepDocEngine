@@ -35,10 +35,10 @@
                         <Separator />
                         <MenuItem Header="对文件夹执行深度查密..." Click="MenuDeepCheckFolder_Click" FontWeight="SemiBold" Foreground="#B45309" />
                         <MenuItem Header="对文件执行深度查密..." Click="MenuDeepCheckFiles_Click" FontWeight="SemiBold" Foreground="#B45309" />
-                        <MenuItem Header="深度擦除选中文件（三遍防杀软覆写粉碎）" InputGestureText="Ctrl+Shift+Del"
+                        <MenuItem Header="彻底销毁选中文件（安全粉碎，免天擎/杀软误报）" InputGestureText="Ctrl+Shift+Del"
                                   Click="MenuDeepDeleteSelected_Click" Foreground="#DC2626" FontWeight="SemiBold" />
-                        <MenuItem Header="选择文件夹执行深度擦除..." Click="MenuDeepEraseFolder_Click" Foreground="#B91C1C" />
-                        <MenuItem Header="选择文件执行深度擦除..." Click="MenuDeepDeletePicker_Click" Foreground="#B91C1C" />
+                        <MenuItem Header="选择文件夹执行彻底销毁..." Click="MenuDeepEraseFolder_Click" Foreground="#B91C1C" />
+                        <MenuItem Header="选择文件执行彻底销毁..." Click="MenuDeepDeletePicker_Click" Foreground="#B91C1C" />
                         <Separator />
                         <MenuItem Header="退出(_X)" InputGestureText="Alt+F4" Click="MenuExit_Click" />
                     </MenuItem>
@@ -106,8 +106,8 @@
                         <MenuItem x:Name="MenuDeepCheckRerunDefaults" Header="重查默认涉密词 (秘密/机密/绝密/内部文件/内部资料/不公开)" Click="MenuDeepCheckRerunDefaults_Click" />
                         <MenuItem x:Name="MenuExitDeepCheck" Header="退出深度查密模式（恢复全库检索）" IsEnabled="False" Click="BtnExitDeepCheck_Click" />
                         <Separator />
-                        <MenuItem x:Name="MenuDeepEraseFolder" Header="对文件夹执行深度擦除（三遍防杀软覆写）..." Click="MenuDeepEraseFolder_Click" Foreground="#DC2626" FontWeight="SemiBold" />
-                        <MenuItem x:Name="MenuDeepEraseFiles" Header="对文件执行深度擦除（三遍防杀软覆写）..." Click="MenuDeepDeletePicker_Click" Foreground="#B91C1C" />
+                        <MenuItem x:Name="MenuDeepEraseFolder" Header="对文件夹执行彻底销毁（递归粉碎，免天擎/杀软误报）..." Click="MenuDeepEraseFolder_Click" Foreground="#DC2626" FontWeight="SemiBold" />
+                        <MenuItem x:Name="MenuDeepEraseFiles" Header="对文件执行彻底销毁（安全粉碎，免天擎/杀软误报）..." Click="MenuDeepDeletePicker_Click" Foreground="#B91C1C" />
                     </MenuItem>
 
                     <MenuItem Header="选项(_O)">
